@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import ctypes
 import os
+import struct
 import subprocess
 import time
+import zlib
+from ctypes import wintypes
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -26,6 +29,10 @@ MENU_MASK_KEY = 0xE8
 SEARCH_SETTLE = 0.8
 FIRST_ROW_Y = 30
 SCROLL_SETTLE = 0.15
+SEARCH_ALL_TITLE = "통합검색"
+SEARCH_ALL_OFFSET = 25
+SEARCH_ALL_SETTLE = 2.5
+PW_RENDERFULLCONTENT = 2
 CHAT_LIST_VIEW = "ChatRoomListView"
 
 
@@ -400,6 +407,116 @@ def send_message(room: str, message: str, *, exact: bool = False) -> WindowInfo:
     remaining = win32gui.GetWindowText(input_hwnd)
     if remaining == message:
         raise KakaoError("Enter 입력 후에도 메시지가 남아 있습니다. 전송 여부를 직접 확인하세요.")
+    return window
+
+
+def _png_bytes(width: int, height: int, bgra: bytes) -> bytes:
+    rgb = bytearray(width * height * 3)
+    rgb[0::3], rgb[1::3], rgb[2::3] = bgra[2::4], bgra[1::4], bgra[0::4]
+    rows = b"".join(b"\0" + bytes(rgb[y * width * 3 : (y + 1) * width * 3]) for y in range(height))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+
+
+def _capture_window(hwnd: int, path: Path) -> None:
+    """Save only this window as a PNG, so other windows on screen are never included."""
+    user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+    handle = wintypes.HANDLE
+    user32.GetWindowDC.restype = handle
+    user32.GetWindowDC.argtypes = [wintypes.HWND]
+    user32.ReleaseDC.argtypes = [wintypes.HWND, handle]
+    user32.PrintWindow.argtypes = [wintypes.HWND, handle, wintypes.UINT]
+    gdi32.CreateCompatibleDC.restype = handle
+    gdi32.CreateCompatibleDC.argtypes = [handle]
+    gdi32.CreateCompatibleBitmap.restype = handle
+    gdi32.CreateCompatibleBitmap.argtypes = [handle, ctypes.c_int, ctypes.c_int]
+    gdi32.SelectObject.restype = handle
+    gdi32.SelectObject.argtypes = [handle, handle]
+    gdi32.GetDIBits.argtypes = [
+        handle, handle, wintypes.UINT, wintypes.UINT, ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT,
+    ]
+    gdi32.DeleteObject.argtypes = [handle]
+    gdi32.DeleteDC.argtypes = [handle]
+
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    width, height = right - left, bottom - top
+    window_dc = user32.GetWindowDC(hwnd)
+    memory_dc = gdi32.CreateCompatibleDC(window_dc)
+    bitmap = gdi32.CreateCompatibleBitmap(window_dc, width, height)
+    previous = gdi32.SelectObject(memory_dc, bitmap)
+    try:
+        if not user32.PrintWindow(hwnd, memory_dc, PW_RENDERFULLCONTENT):
+            raise KakaoError("검색 결과 창을 이미지로 저장하지 못했습니다.")
+        pixels = ctypes.create_string_buffer(width * height * 4)
+        info = struct.pack("<IiiHHIIiiII", 40, width, -height, 1, 32, 0, 0, 0, 0, 0, 0)
+        if gdi32.GetDIBits(memory_dc, bitmap, 0, height, pixels, info, 0) != height:
+            raise KakaoError("검색 결과 창의 이미지를 읽지 못했습니다.")
+    finally:
+        gdi32.SelectObject(memory_dc, previous)
+        gdi32.DeleteObject(bitmap)
+        gdi32.DeleteDC(memory_dc)
+        user32.ReleaseDC(hwnd, window_dc)
+    raw = pixels.raw
+    if raw == raw[:4] * (width * height):
+        raise KakaoError("검색 결과 창이 빈 이미지로 저장됐습니다. 창을 가리지 않게 두고 다시 실행하세요.")
+    path.write_bytes(_png_bytes(width, height, raw))
+
+
+def _click_search_all(main_hwnd: int, search_box: int) -> None:
+    view = next(
+        c for c in _visible_children(main_hwnd) if win32gui.GetWindowText(c).startswith(CHAT_LIST_VIEW)
+    )
+    view_left, view_top, _right, _bottom = win32gui.GetWindowRect(view)
+    _left, box_top, box_right, box_bottom = win32gui.GetWindowRect(search_box)
+    x, y = box_right + SEARCH_ALL_OFFSET - view_left, (box_top + box_bottom) // 2 - view_top
+    position = (y << 16) | x
+    win32gui.PostMessage(view, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, position)
+    win32gui.PostMessage(view, win32con.WM_LBUTTONUP, 0, position)
+
+
+def search_messages(query: str, image: Path, *, keep_open: bool = False, timeout: float = 3.0) -> WindowInfo:
+    """Run KakaoTalk's integrated search and save its window as an image. Opens no result.
+
+    The result list cannot be read as text, so the image is the output.
+    """
+    if not query.strip():
+        raise KakaoError("검색어를 입력하세요.")
+    main = find_main_window()
+    if not main:
+        raise KakaoError("카카오톡 메인 창을 찾지 못했습니다.")
+    _close_windows({w.hwnd for w in list_windows() if w.visible and w.title == SEARCH_ALL_TITLE})
+    time.sleep(0.3)
+
+    search_box = _chat_search_box(main.hwnd)
+    before = _visible_hwnds()
+    win32gui.SendMessage(search_box, win32con.WM_SETTEXT, 0, query)
+    try:
+        # An inactive window can use the first click just to activate itself.
+        _focus(main.hwnd)
+        time.sleep(SEARCH_SETTLE)
+        _click_search_all(main.hwnd, search_box)
+        opened: list[WindowInfo] = []
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not opened:
+            opened = [w for w in list_windows() if w.visible and w.hwnd not in before and w.title.strip()]
+            time.sleep(0.1)
+    finally:
+        win32gui.SendMessage(search_box, win32con.WM_SETTEXT, 0, "")
+    if len(opened) != 1 or opened[0].title != SEARCH_ALL_TITLE:
+        _close_windows({w.hwnd for w in opened})
+        raise KakaoError("통합검색 창을 열지 못했습니다. 메인 창을 가리지 않게 두고 다시 실행하세요.")
+
+    window = opened[0]
+    try:
+        time.sleep(SEARCH_ALL_SETTLE)
+        _capture_window(window.hwnd, image)
+    finally:
+        if not keep_open:
+            _close_windows({window.hwnd})
     return window
 
 

@@ -1,3 +1,6 @@
+import struct
+import zlib
+
 import pytest
 
 import kakaocli_win.backend as backend
@@ -148,6 +151,51 @@ def test_foreground_lost_before_enter_does_not_send(focus_env, monkeypatch):
     with pytest.raises(KakaoError, match="맨 앞"):
         backend.send_message("개발팀", "테스트")
     assert backend.win32con.VK_RETURN not in focus_env
+
+
+def test_png_bytes_encodes_pixels():
+    png = backend._png_bytes(2, 1, bytes([1, 2, 3, 255, 4, 5, 6, 255]))
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    assert struct.unpack(">II", png[16:24]) == (2, 1)
+    compressed = png[png.index(b"IDAT") + 4 : png.index(b"IEND") - 8]
+    assert zlib.decompress(compressed) == bytes([0, 3, 2, 1, 6, 5, 4])
+
+
+def test_search_messages_captures_then_closes_without_opening_a_result(search_env, monkeypatch, tmp_path):
+    captured = []
+    dialog = WindowInfo(900, backend.SEARCH_ALL_TITLE, backend.CHAT_CLASS, 580, 640, True, "popup")
+    monkeypatch.setattr(backend, "SEARCH_ALL_SETTLE", 0)
+    monkeypatch.setattr(backend, "_capture_window", lambda hwnd, path: captured.append((hwnd, path)))
+    monkeypatch.setattr(backend, "_click_search_all", lambda _m, _b: search_env["windows"].append(dialog))
+    image = tmp_path / "result.png"
+    assert backend.search_messages("11월 25일", image, timeout=0.2) == dialog
+    assert captured == [(900, image)]
+    assert search_env["closed"] == [900]
+    assert search_env["texts"] == ["11월 25일", ""]
+    assert search_env["keys"] == []
+
+
+def test_search_messages_keep_open_leaves_window(search_env, monkeypatch, tmp_path):
+    dialog = WindowInfo(900, backend.SEARCH_ALL_TITLE, backend.CHAT_CLASS, 580, 640, True, "popup")
+    monkeypatch.setattr(backend, "SEARCH_ALL_SETTLE", 0)
+    monkeypatch.setattr(backend, "_capture_window", lambda _h, _p: None)
+    monkeypatch.setattr(backend, "_click_search_all", lambda _m, _b: search_env["windows"].append(dialog))
+    backend.search_messages("11월 25일", tmp_path / "r.png", keep_open=True, timeout=0.2)
+    assert search_env["closed"] == []
+
+
+def test_search_messages_closes_unexpected_window(search_env, monkeypatch, tmp_path):
+    other = WindowInfo(900, "친구 추가", backend.CHAT_CLASS, 300, 460, True, "popup")
+    monkeypatch.setattr(backend, "_click_search_all", lambda _m, _b: search_env["windows"].append(other))
+    image = tmp_path / "r.png"
+    with pytest.raises(KakaoError, match="통합검색"):
+        backend.search_messages("11월 25일", image, timeout=0.2)
+    assert search_env["closed"] == [900] and not image.exists()
+
+
+def test_search_messages_rejects_blank_query(tmp_path):
+    with pytest.raises(KakaoError, match="검색어"):
+        backend.search_messages("  ", tmp_path / "r.png")
 
 
 def test_scroll_up_posts_wheel_messages_to_the_list(monkeypatch):

@@ -17,6 +17,7 @@ from .backend import (
     open_room,
     read_visible,
     search_and_open,
+    search_messages,
     send_message,
     start_kakaotalk,
 )
@@ -59,6 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
     open_parser.add_argument(
         "--search", action="store_true", help="닫힌 방을 채팅 탭에서 검색해 열기. 제목이 정확히 같을 때만 유지"
     )
+
+    search_parser = sub.add_parser("search", help="통합검색으로 메시지를 찾아 결과 창을 이미지로 저장")
+    search_parser.add_argument("query")
+    search_parser.add_argument("--output", required=True, help="결과 이미지 PNG 경로")
+    search_parser.add_argument("--keep-open", action="store_true", help="저장 후 통합검색 창을 닫지 않음")
 
     read_parser = sub.add_parser("read", help="열린 화면에 보이는 대화 복사")
     read_parser.add_argument("room")
@@ -143,6 +149,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "open":
             window = search_and_open(args.room) if args.search else open_room(args.room, exact=args.exact)
             result = {"opened": window.to_dict()}
+        elif args.command == "search":
+            output = Path(args.output)
+            search_messages(args.query, output, keep_open=args.keep_open)
+            result = {"query": args.query, "image": str(output), "kept_open": args.keep_open}
         elif args.command == "read":
             window, text = read_visible(args.room, exact=args.exact, scroll=args.scroll)
             result = {"room": window.title, "text": text}

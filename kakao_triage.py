@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -194,6 +195,26 @@ def judge(room, messages, indexes, key):
 
     with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
         return list(pool.map(one, indexes))
+
+
+def date_queries(date):
+    """Spellings of a date to search for. Relative words like 'next Friday' cannot be searched this way."""
+    month, day = date.month, date.day
+    return [f"{month}월 {day}일", f"{month}월{day}일", f"{month}/{day}", f"{month}.{day}", f"{day}일"]
+
+
+def search_date(date):
+    """Run integrated search for each spelling. Images can hold private text, so they stay in a temp folder."""
+    folder = Path(tempfile.mkdtemp(prefix="kakao-search-"))
+    results = []
+    for index, query in enumerate(date_queries(date)):
+        image = folder / f"{index}.png"
+        try:
+            run_kakaocli("search", query, "--output", str(image))
+            results.append({"query": query, "image": str(image)})
+        except (RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
+            results.append({"query": query, "error": str(error)})
+    return results
 
 
 def parse_message_date(header):
@@ -412,6 +433,8 @@ def self_check():
     assert [r["text"] for r in flagged] == ["a"] and [r["text"] for r in failed] == ["c"]
     assert [r["text"] for r in bucket(labeled, 0.5, ALL_CATEGORIES)[0]] == ["b", "a"]
 
+    assert date_queries(datetime.date(2026, 3, 5)) == ["3월 5일", "3월5일", "3/5", "3.5", "5일"]
+
     saturday = datetime.date(2026, 11, 7)
     at = datetime.time
     day = lambda month, date: datetime.date(2026, month, date)
@@ -492,6 +515,11 @@ def main():
     )
     parser.add_argument("--scroll", type=int, default=0, help="읽기 전에 위로 스크롤할 횟수. 과거 대화를 불러옴")
     parser.add_argument("--events", help="일정 메시지를 비교할 캘린더 일정 JSON 파일. 수정은 하지 않음")
+    parser.add_argument(
+        "--date",
+        type=datetime.date.fromisoformat,
+        help="YYYY-MM-DD 날짜를 표현 여러 개로 통합검색해 결과 이미지 경로를 출력. 외부 전송과 방 열기 없음",
+    )
     parser.add_argument("--dry-run", action="store_true", help="외부 전송 없이 읽기와 파싱만 확인")
     parser.add_argument("--json", action="store_true", help="결과를 JSON으로 출력")
     parser.add_argument("--self-check", action="store_true", help="네트워크와 카카오톡 없이 로직 점검")
@@ -500,6 +528,10 @@ def main():
 
     if args.self_check:
         return self_check()
+    if args.date:
+        results = search_date(args.date)
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+        return None
     if bool(args.rooms) == args.all_open:
         parser.error("방 이름 또는 --all-open 중 하나를 지정하세요.")
     key = os.environ.get("TYPESAFE_API_KEY", "")

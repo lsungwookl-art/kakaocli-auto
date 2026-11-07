@@ -70,6 +70,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 # 위로 40회 스크롤해 과거 대화까지 읽기
 .\kakaocli.cmd read "홍길동" --scroll 40
 
+# 통합검색으로 메시지를 찾아 결과 창을 이미지로 저장 (결과 방은 열지 않음)
+.\kakaocli.cmd search "11월 25일" --output ".\result.png"
+
 # 실제 전송 전 점검
 .\kakaocli.cmd send "홍길동" "테스트입니다" --dry-run
 
