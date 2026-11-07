@@ -24,7 +24,7 @@ import urllib.request
 from ctypes import wintypes
 from pathlib import Path
 
-KAKAOCLI = Path(os.environ.get("KAKAOCLI", Path.home() / "kakaocli-win/.venv/Scripts/kakaocli.exe"))
+KAKAOCLI = Path(os.environ.get("KAKAOCLI", Path(__file__).resolve().parent / ".venv/Scripts/kakaocli.exe"))
 API_URL = "https://api.typesafe.ai/v1/systemone"
 CONTEXT_MESSAGES = 5
 WORKERS = 4
@@ -89,7 +89,7 @@ def pending(messages, me):
 def run_kakaocli(*args):
     env = {**os.environ, "PYTHONUTF8": "1"}
     done = subprocess.run(
-        [str(KAKAOCLI), "--json", *args], capture_output=True, encoding="utf-8", errors="replace", env=env, timeout=30
+        [str(KAKAOCLI), "--json", *args], capture_output=True, encoding="utf-8", errors="replace", env=env, timeout=120
     )
     if done.returncode != 0:
         raise RuntimeError((done.stderr or done.stdout).strip()[:300] or f"exit {done.returncode}")
@@ -210,8 +210,8 @@ def search_date(date):
     for index, query in enumerate(date_queries(date)):
         image = folder / f"{index}.png"
         try:
-            run_kakaocli("search", query, "--output", str(image))
-            results.append({"query": query, "image": str(image)})
+            found = run_kakaocli("search", query, "--output", str(image))
+            results.append({"query": query, "images": found["images"], "complete": found["complete"]})
         except (RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
             results.append({"query": query, "error": str(error)})
     return results

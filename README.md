@@ -1,14 +1,21 @@
-# kakaocli-win
+# kakaocli-auto
 
 Windows 10/11용 비공식 카카오톡 CLI입니다. 카카오 공식 API나 프로토콜을 사용하지 않고, 실행 중인 PC 카카오톡 창을 Win32 API로 조작합니다.
+
+[Lee-SiHyeon/kakaocli-win](https://github.com/Lee-SiHyeon/kakaocli-win)에서 갈라져 나온 저장소로, 닫힌 방 찾기, 메시지 검색, 메시지 분류, 일정 비교를 추가했습니다. 카카오나 원본 저장소와 제휴 관계가 없습니다.
+
+Windows용 PC 카카오톡 26.9에서 확인했습니다. 다른 버전이나 화면 배율에서는 동작이 다를 수 있습니다.
 
 ## 현재 지원 범위
 
 - 카카오톡 설치·실행 상태 점검
 - 현재 독립 창으로 열린 채팅방 목록
 - 이미 독립 창으로 열린 채팅방 포커스
-- 화면에 로드된 대화 텍스트 읽기
+- 닫힌 채팅방을 채팅 탭에서 검색해 열기
+- 통합검색으로 메시지를 찾아 결과 창을 이미지로 저장
+- 대화 텍스트 읽기(스크롤로 과거 대화 포함)
 - 확인 후 메시지 전송
+- 메시지 분류와 일정 비교(`kakao_triage.py`)
 - 자동화용 JSON 출력
 - 카카오톡 업데이트 호환성 진단용 컨트롤 트리 출력
 - 실행 중인 `KakaoTalk.exe` 메모리에서 SQLCipher 4 raw key 후보 복구
@@ -37,8 +44,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 GitHub에서 바로 설치하려면 다음처럼 복제할 수 있습니다.
 
 ```powershell
-git clone https://github.com/Lee-SiHyeon/kakaocli-win.git
-cd kakaocli-win
+git clone https://github.com/lsungwookl-art/kakaocli-auto.git
+cd kakaocli-auto
 Set-ExecutionPolicy -Scope Process Bypass
 .\install.ps1
 ```
@@ -71,7 +78,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\kakaocli.cmd read "홍길동" --scroll 40
 
 # 통합검색으로 메시지를 찾아 결과 창을 이미지로 저장 (결과 방은 열지 않음)
-.\kakaocli.cmd search "11월 25일" --output ".\result.png"
+# 결과가 많으면 result-2.png처럼 이어서 저장하고, complete 값으로 끝까지 봤는지 알려 줌
+.\kakaocli.cmd --json search "11월 25일" --output ".\result.png" --pages 10
 
 # 실제 전송 전 점검
 .\kakaocli.cmd send "홍길동" "테스트입니다" --dry-run
@@ -120,6 +128,39 @@ Set-ExecutionPolicy -Scope Process Bypass
 ```
 
 동일한 문자열이 들어간 방이 여러 개면 전송을 중단합니다. 자동화에서는 완전한 채팅방 이름과 `--exact` 사용을 권장합니다.
+
+## 메시지 분류와 일정 비교
+
+`kakao_triage.py`는 독립 창으로 열어 둔 방을 읽어 메시지를 분류합니다. 전송 기능은 없습니다. 분류에는 [TypeSafe](https://docs.typesafe.ai)의 Jev를 쓰므로 `TYPESAFE_API_KEY` 환경 변수가 필요합니다.
+
+```powershell
+# 외부 전송 없이 읽기만 확인
+python .\kakao_triage.py "방이름" --dry-run
+
+# 내 마지막 메시지 이후에서 답장이 필요한 메시지 고르기
+python .\kakao_triage.py "방이름" --me "내 대화 이름"
+
+# 전체 분류 보기 (잡담, 정보, 요청, 문제, 결정, 일정, 질문)
+python .\kakao_triage.py "방이름" --category 전체
+
+# 과거 대화까지 읽어 일정 메시지만 보기
+python .\kakao_triage.py "방이름" --scroll 40 --limit 200 --category 일정
+
+# 일정 메시지를 캘린더 일정 JSON과 비교해 수정안 만들기 (캘린더는 바꾸지 않음)
+python .\kakao_triage.py "방이름" --events ".\events.json"
+
+# 날짜를 여러 표현으로 통합검색해 결과 이미지 경로 출력
+python .\kakao_triage.py --date 2026-11-25
+```
+
+일정 비교 결과는 `수정안`, `일치`, `캘린더에 없음`, `확인 필요` 중 하나입니다. "쯤", "아직", 질문처럼 확정되지 않은 표현과 오전/오후가 없는 시간, 반복 일정, 종일 일정은 추측하지 않고 `확인 필요`로 표시합니다. `events.json`은 `{"events": [...]}` 형식이고, 일정마다 `id`, `summary`, `start.dateTime`, `end.dateTime`이 필요합니다.
+
+주의할 점:
+
+- 대화 내용과 보낸 사람 이름이 TypeSafe로 전송됩니다. `--dry-run`과 `--date`는 전송하지 않습니다.
+- 정확도는 실제 대화로 충분히 검증하지 않았습니다. 수정안은 사람이 확인한 뒤 적용하세요.
+- `--date` 결과 이미지에는 메시지가 그대로 들어 있고 임시 폴더에 남습니다. 확인 후 직접 삭제하세요.
+- 통합검색은 적힌 글자를 찾으므로 "다음 주 수요일"처럼 돌려 말한 날짜는 찾기 어렵습니다.
 
 ## 문제 해결
 
@@ -180,6 +221,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 `privacy-audit.ps1`은 로컬 사용자 경로, 흔한 토큰 형식, 비밀키와 DB/키 저장 파일을 검사합니다. 이는 보조 검사이므로 커밋 전 `git diff --cached`도 직접 확인하세요.
 
 ## 출처
+
+이 저장소는 [Lee-SiHyeon/kakaocli-win](https://github.com/Lee-SiHyeon/kakaocli-win)을 기반으로 합니다.
 
 Windows의 `EVA_Window_Dblclk`/`RICHEDIT50W` 탐색 방식은 [rime10221/kakao_MCP](https://github.com/rime10221/kakao_MCP)의 공개 구현을 참고해 안전 확인과 진단 기능을 추가했습니다. 이 프로젝트는 해당 저장소나 카카오와 제휴되어 있지 않습니다.
 

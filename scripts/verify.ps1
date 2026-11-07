@@ -11,5 +11,11 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
+$env:PYTHONUTF8 = "1"
+& $Python -I (Join-Path $ProjectRoot "kakao_triage.py") --self-check
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
 & (Join-Path $PSScriptRoot "privacy-audit.ps1") -Root $ProjectRoot
 exit $LASTEXITCODE

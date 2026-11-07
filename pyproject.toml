@@ -1,14 +1,15 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kakaocli-win"
-version = "0.3.0"
-description = "A safety-first, unofficial KakaoTalk CLI for Windows"
+name = "kakaocli-auto"
+version = "0.4.0"
+description = "An unofficial KakaoTalk CLI for Windows with room search, message triage and schedule comparison"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = ["pywin32>=306", "numpy>=1.26", "cryptography>=42"]
 
 [project.scripts]

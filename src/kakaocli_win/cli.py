@@ -65,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("query")
     search_parser.add_argument("--output", required=True, help="결과 이미지 PNG 경로")
     search_parser.add_argument("--keep-open", action="store_true", help="저장 후 통합검색 창을 닫지 않음")
+    search_parser.add_argument("--pages", type=int, default=10, help="스크롤하며 저장할 최대 이미지 수")
 
     read_parser = sub.add_parser("read", help="열린 화면에 보이는 대화 복사")
     read_parser.add_argument("room")
@@ -150,9 +151,10 @@ def main(argv: list[str] | None = None) -> int:
             window = search_and_open(args.room) if args.search else open_room(args.room, exact=args.exact)
             result = {"opened": window.to_dict()}
         elif args.command == "search":
-            output = Path(args.output)
-            search_messages(args.query, output, keep_open=args.keep_open)
-            result = {"query": args.query, "image": str(output), "kept_open": args.keep_open}
+            images, complete = search_messages(
+                args.query, Path(args.output), keep_open=args.keep_open, pages=args.pages
+            )
+            result = {"query": args.query, "images": [str(path) for path in images], "complete": complete}
         elif args.command == "read":
             window, text = read_visible(args.room, exact=args.exact, scroll=args.scroll)
             result = {"room": window.title, "text": text}

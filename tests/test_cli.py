@@ -161,24 +161,65 @@ def test_png_bytes_encodes_pixels():
     assert zlib.decompress(compressed) == bytes([0, 3, 2, 1, 6, 5, 4])
 
 
-def test_search_messages_captures_then_closes_without_opening_a_result(search_env, monkeypatch, tmp_path):
-    captured = []
+def test_search_messages_saves_pages_then_closes_without_opening_a_result(search_env, monkeypatch, tmp_path):
     dialog = WindowInfo(900, backend.SEARCH_ALL_TITLE, backend.CHAT_CLASS, 580, 640, True, "popup")
     monkeypatch.setattr(backend, "SEARCH_ALL_SETTLE", 0)
-    monkeypatch.setattr(backend, "_capture_window", lambda hwnd, path: captured.append((hwnd, path)))
+    monkeypatch.setattr(backend, "_save_result_pages", lambda hwnd, path, pages: ([path], True))
     monkeypatch.setattr(backend, "_click_search_all", lambda _m, _b: search_env["windows"].append(dialog))
     image = tmp_path / "result.png"
-    assert backend.search_messages("11월 25일", image, timeout=0.2) == dialog
-    assert captured == [(900, image)]
+    assert backend.search_messages("11월 25일", image, timeout=0.2) == ([image], True)
     assert search_env["closed"] == [900]
     assert search_env["texts"] == ["11월 25일", ""]
     assert search_env["keys"] == []
 
 
+@pytest.fixture
+def pages_env(monkeypatch):
+    """Fake capture and result list; `shots` is the sequence of captured images."""
+    state = {"shots": [], "scrolled": 0}
+    monkeypatch.setattr(backend, "SEARCH_SCROLL_SETTLE", 0)
+    monkeypatch.setattr(backend, "SCROLL_SETTLE", 0)
+    monkeypatch.setattr(backend, "_visible_children", lambda _hwnd: [11, 12])
+    monkeypatch.setattr(backend.win32gui, "GetClassName", lambda _hwnd: backend.SEARCH_RESULT_CLASS)
+    monkeypatch.setattr(
+        backend.win32gui, "GetWindowRect", lambda hwnd: (0, 0, 100, 100) if hwnd == 12 else (0, 0, 10, 10)
+    )
+    monkeypatch.setattr(backend, "_capture_window", lambda _hwnd: state["shots"].pop(0))
+
+    def post(hwnd, _message, wparam, _position):
+        assert hwnd == 12, "the largest result list must receive the scroll"
+        assert wparam >> 16 == (-backend.win32con.WHEEL_DELTA & 0xFFFF)
+        state["scrolled"] += 1
+
+    monkeypatch.setattr(backend.win32gui, "PostMessage", post)
+    return state
+
+
+def test_result_pages_stop_when_scrolling_changes_nothing(pages_env, tmp_path):
+    pages_env["shots"] = [b"a", b"b", b"b"]
+    image = tmp_path / "p.png"
+    saved, complete = backend._save_result_pages(900, image, 10)
+    assert complete is True
+    assert saved == [image, tmp_path / "p-2.png"]
+    assert [path.read_bytes() for path in saved] == [b"a", b"b"]
+
+
+def test_result_pages_report_incomplete_at_page_limit(pages_env, tmp_path):
+    pages_env["shots"] = [b"a", b"b", b"c"]
+    saved, complete = backend._save_result_pages(900, tmp_path / "p.png", 3)
+    assert complete is False and len(saved) == 3
+
+
+def test_single_result_page_is_complete(pages_env, tmp_path):
+    pages_env["shots"] = [b"a", b"a"]
+    saved, complete = backend._save_result_pages(900, tmp_path / "p.png", 10)
+    assert complete is True and len(saved) == 1
+
+
 def test_search_messages_keep_open_leaves_window(search_env, monkeypatch, tmp_path):
     dialog = WindowInfo(900, backend.SEARCH_ALL_TITLE, backend.CHAT_CLASS, 580, 640, True, "popup")
     monkeypatch.setattr(backend, "SEARCH_ALL_SETTLE", 0)
-    monkeypatch.setattr(backend, "_capture_window", lambda _h, _p: None)
+    monkeypatch.setattr(backend, "_save_result_pages", lambda _h, path, _p: ([path], True))
     monkeypatch.setattr(backend, "_click_search_all", lambda _m, _b: search_env["windows"].append(dialog))
     backend.search_messages("11월 25일", tmp_path / "r.png", keep_open=True, timeout=0.2)
     assert search_env["closed"] == []

@@ -32,6 +32,10 @@ SCROLL_SETTLE = 0.15
 SEARCH_ALL_TITLE = "통합검색"
 SEARCH_ALL_OFFSET = 25
 SEARCH_ALL_SETTLE = 2.5
+SEARCH_RESULT_CLASS = "EVA_ChildWindow_Dblclk"
+SEARCH_SCROLL_TICKS = 4
+SEARCH_SCROLL_SETTLE = 0.5
+MESSAGE_TAB_X, MESSAGE_TAB_Y = 178, 148
 PW_RENDERFULLCONTENT = 2
 CHAT_LIST_VIEW = "ChatRoomListView"
 
@@ -422,8 +426,8 @@ def _png_bytes(width: int, height: int, bgra: bytes) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
 
 
-def _capture_window(hwnd: int, path: Path) -> None:
-    """Save only this window as a PNG, so other windows on screen are never included."""
+def _capture_window(hwnd: int) -> bytes:
+    """Return only this window as a PNG, so other windows on screen are never included."""
     user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
     handle = wintypes.HANDLE
     user32.GetWindowDC.restype = handle
@@ -463,7 +467,38 @@ def _capture_window(hwnd: int, path: Path) -> None:
     raw = pixels.raw
     if raw == raw[:4] * (width * height):
         raise KakaoError("검색 결과 창이 빈 이미지로 저장됐습니다. 창을 가리지 않게 두고 다시 실행하세요.")
-    path.write_bytes(_png_bytes(width, height, raw))
+    return _png_bytes(width, height, raw)
+
+
+def _page_path(image: Path, index: int) -> Path:
+    return image if index == 0 else image.with_name(f"{image.stem}-{index + 1}{image.suffix}")
+
+
+def _save_result_pages(hwnd: int, image: Path, pages: int) -> tuple[list[Path], bool]:
+    """Save result pages until scrolling changes nothing. The bool says the end of the list was reached."""
+    page = _capture_window(hwnd)
+    image.write_bytes(page)
+    saved = [image]
+    lists = [c for c in _visible_children(hwnd) if win32gui.GetClassName(c) == SEARCH_RESULT_CLASS]
+    if not lists:
+        return saved, False
+
+    def area(child: int) -> int:
+        left, top, right, bottom = win32gui.GetWindowRect(child)
+        return (right - left) * (bottom - top)
+
+    results = max(lists, key=area)
+    while len(saved) < pages:
+        _scroll(results, SEARCH_SCROLL_TICKS, -win32con.WHEEL_DELTA)
+        time.sleep(SEARCH_SCROLL_SETTLE)
+        following = _capture_window(hwnd)
+        if following == page:
+            return saved, True
+        path = _page_path(image, len(saved))
+        path.write_bytes(following)
+        saved.append(path)
+        page = following
+    return saved, False
 
 
 def _click_search_all(main_hwnd: int, search_box: int) -> None:
@@ -478,10 +513,13 @@ def _click_search_all(main_hwnd: int, search_box: int) -> None:
     win32gui.PostMessage(view, win32con.WM_LBUTTONUP, 0, position)
 
 
-def search_messages(query: str, image: Path, *, keep_open: bool = False, timeout: float = 3.0) -> WindowInfo:
-    """Run KakaoTalk's integrated search and save its window as an image. Opens no result.
+def search_messages(
+    query: str, image: Path, *, keep_open: bool = False, pages: int = 10, timeout: float = 3.0
+) -> tuple[list[Path], bool]:
+    """Run KakaoTalk's integrated message search and save its window as images. Opens no result.
 
-    The result list cannot be read as text, so the image is the output.
+    The result list cannot be read as text, so images are the output. Returns the
+    saved paths and whether the end of the list was reached within `pages`.
     """
     if not query.strip():
         raise KakaoError("검색어를 입력하세요.")
@@ -512,21 +550,27 @@ def search_messages(query: str, image: Path, *, keep_open: bool = False, timeout
 
     window = opened[0]
     try:
+        position = (MESSAGE_TAB_Y << 16) | MESSAGE_TAB_X
+        win32gui.PostMessage(window.hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, position)
+        win32gui.PostMessage(window.hwnd, win32con.WM_LBUTTONUP, 0, position)
         time.sleep(SEARCH_ALL_SETTLE)
-        _capture_window(window.hwnd, image)
+        return _save_result_pages(window.hwnd, image, pages)
     finally:
         if not keep_open:
             _close_windows({window.hwnd})
-    return window
+
+
+def _scroll(hwnd: int, ticks: int, delta: int) -> None:
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    position = (((top + bottom) // 2 & 0xFFFF) << 16) | ((left + right) // 2 & 0xFFFF)
+    for _ in range(ticks):
+        win32gui.PostMessage(hwnd, win32con.WM_MOUSEWHEEL, (delta & 0xFFFF) << 16, position)
+        time.sleep(SCROLL_SETTLE)
 
 
 def _scroll_up(hwnd: int, ticks: int) -> None:
     """Scroll the chat list toward older messages so KakaoTalk loads them."""
-    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-    position = (((top + bottom) // 2 & 0xFFFF) << 16) | ((left + right) // 2 & 0xFFFF)
-    for _ in range(ticks):
-        win32gui.PostMessage(hwnd, win32con.WM_MOUSEWHEEL, win32con.WHEEL_DELTA << 16, position)
-        time.sleep(SCROLL_SETTLE)
+    _scroll(hwnd, ticks, win32con.WHEEL_DELTA)
 
 
 def read_visible(
