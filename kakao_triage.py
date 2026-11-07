@@ -1,18 +1,22 @@
-"""Read-only KakaoTalk triage: read open rooms with kakaocli, flag what needs a reply with Jev.
+"""KakaoTalk triage: read open rooms with kakaocli, sort messages with Jev, and prepare items for review.
 
-This tool has no send path. Message text goes to the TypeSafe API unless --dry-run is set.
+The only send path is --report-room, which needs a person to answer y. Message text goes to
+the TypeSafe API unless --dry-run is set. Settings and tracking state stay outside the repository.
 
     python kakao_triage.py "방이름" --me "내 이름"
     python kakao_triage.py --all-open --me "내 이름"
     python kakao_triage.py "방이름" --dry-run
+    python kakao_triage.py --briefing --track
     python kakao_triage.py --self-check
 """
 import argparse
 import concurrent.futures
+import copy
 import ctypes
 import dataclasses
 import datetime
 import decimal
+import hashlib
 import json
 import os
 import re
@@ -21,12 +25,32 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from ctypes import wintypes
 from pathlib import Path
 
 KAKAOCLI = Path(os.environ.get("KAKAOCLI", Path(__file__).resolve().parent / ".venv/Scripts/kakaocli.exe"))
 API_URL = "https://api.typesafe.ai/v1/systemone"
+CALENDAR_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+DATA_DIR = Path(os.environ.get("KAKAO_TRIAGE_HOME") or Path(os.environ.get("LOCALAPPDATA", Path.home())) / "kakaocli-auto")
+CONFIG_DEFAULTS = {
+    "rooms": [],
+    "me": "",
+    "threshold": 0.5,
+    "limit": 30,
+    "days": 1,
+    "scroll": 0,
+    "overdue_hours": 24,
+    "report_room": "",
+    "rules": [],
+    "aliases": {},
+}
+ARGUMENT_SETTINGS = ("me", "threshold", "limit", "days", "scroll", "overdue_hours", "report_room")
+TRACKED_CATEGORIES = ("문제", "결정", "요청", "질문")
+SEEN_PER_ROOM = 5000
+REPORT_LIMIT = 900
+EVALUATION_THRESHOLDS = (0.3, 0.4, 0.5, 0.6, 0.7)
 CONTEXT_MESSAGES = 5
 WORKERS = 4
 RETRIES = 3
@@ -209,14 +233,16 @@ def following_from_sender(messages, index):
     return following
 
 
-def judge(room, messages, indexes, key, invoices=False):
-    questions = {**QUESTIONS, "invoice": INVOICE_QUESTION} if invoices else QUESTIONS
+def judge(room, messages, indexes, key, invoices=False, rules=()):
+    questions = with_rules({**QUESTIONS, "invoice": INVOICE_QUESTION} if invoices else QUESTIONS, rules)
 
     def one(index):
         message = messages[index]
         row = {"room": room, "date": message.date, "time": message.time, "sender": message.sender, "text": message.text}
         try:
-            answers = ask_jev(build_state(room, messages, index), key, questions)["answers"]
+            state = build_state(room, messages, index)
+            row["context"] = state["recent_messages"]
+            answers = ask_jev(state, key, questions)["answers"]
             row["needs_reply"] = answers["needs_reply"]["noul"]
             row["category"] = answers["category"]["choice"]
             if invoices:
@@ -322,7 +348,7 @@ def extract_invoice(text, today):
 def draft_invoice(row):
     """Build a review draft from one message. Issuing is deliberately not implemented."""
     text = "\n".join([row["text"], *row.get("following", [])])
-    draft, missing, warnings = extract_invoice(text, parse_message_date(row["date"]))
+    draft, missing, warnings = extract_invoice(apply_aliases(text, row.get("aliases")), parse_message_date(row["date"]))
     return {
         "status": "확인 필요" if missing or warnings else "초안",
         "room": row["room"],
@@ -347,6 +373,290 @@ def print_invoices(drafts):
             print(f"      빠진 항목: {', '.join(item['missing'])}")
         for warning in item["warnings"]:
             print(f"      주의: {warning}")
+
+
+def load_config(path, required=False):
+    """Read settings from JSON. Unknown keys are an error, so a typo cannot silently drop a rule."""
+    config = copy.deepcopy(CONFIG_DEFAULTS)
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        if required:
+            raise RuntimeError(f"설정 파일이 없습니다: {path}") from None
+        return config
+    except ValueError as error:
+        raise RuntimeError(f"설정 파일을 읽지 못했습니다: {error}") from None
+    unknown = set(data) - set(config)
+    if unknown:
+        raise RuntimeError(f"알 수 없는 설정: {', '.join(sorted(unknown))}")
+    for key, value in data.items():
+        if type(value) is not type(config[key]) and not (key == "threshold" and isinstance(value, int)):
+            raise RuntimeError(f"설정 {key}의 형식이 잘못됐습니다.")
+    return {**config, **data}
+
+
+def with_rules(questions, rules):
+    """Add company rules to every Jev question."""
+    if not rules:
+        return questions
+    updated = copy.deepcopy(questions)
+    guide = "\n회사 기준:\n" + "\n".join(f"- {rule}" for rule in rules)
+    for question in updated.values():
+        question["instructions"] += guide
+    return updated
+
+
+def apply_aliases(text, aliases):
+    """Replace nicknames with official names, longest first, for matching only. Shown text stays original."""
+    if not aliases:
+        return text
+    # One pass, so a replacement is never replaced again by a shorter alias.
+    pattern = "|".join(re.escape(alias) for alias in sorted(aliases, key=len, reverse=True))
+    return re.sub(pattern, lambda match: aliases[match[0]], text)
+
+
+def message_keys(room, messages):
+    """Hash each message, so the state file records what was seen without keeping its text."""
+    counts, keys = {}, []
+    for message in messages:
+        raw = "\0".join([room, message.date, message.time, message.sender, message.text])
+        counts[raw] = counts.get(raw, 0) + 1
+        keys.append(hashlib.sha256(f"{raw}\0{counts[raw]}".encode()).hexdigest()[:20])
+    return keys
+
+
+def message_datetime(date_header, clock):
+    date = parse_message_date(date_header)
+    match = re.match(r"(오전|오후) (\d{1,2}):(\d{2})$", clock or "")
+    if not date or not match:
+        return None
+    hour = int(match[2]) % 12 + (12 if match[1] == "오후" else 0)
+    return datetime.datetime.combine(date, datetime.time(hour, int(match[3])))
+
+
+def load_state(path):
+    try:
+        state = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"seen": {}, "open": []}
+    except ValueError as error:
+        raise RuntimeError(f"추적 기록을 읽지 못했습니다. 파일을 확인하세요: {path} ({error})") from None
+    return {"seen": state.get("seen", {}), "open": state.get("open", [])}
+
+
+def save_state(path, state):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def close_answered(state, room, messages, me):
+    """Close open items in this room older than my latest message. Returns how many closed."""
+    if not me:
+        return 0
+    sent = [message_datetime(m.date, m.time) for m in messages if m.sender == me]
+    sent = [value for value in sent if value]
+    if not sent:
+        return 0
+    latest = max(sent).isoformat()
+    kept = [i for i in state["open"] if i["room"] != room or i["sent"] > latest]
+    closed = len(state["open"]) - len(kept)
+    state["open"] = kept
+    return closed
+
+
+def record_judged(state, room, keys, rows, threshold):
+    """Mark judged messages as seen and open items that need action. Failed messages stay unseen for a retry."""
+    seen = state["seen"].setdefault(room, [])
+    for key, row in zip(keys, rows):
+        if "error" in row:
+            continue
+        seen.append(key)
+        needs_action = row.get("invoice", 0) >= threshold or (
+            row["category"] in TRACKED_CATEGORIES and row["needs_reply"] >= threshold
+        )
+        sent = message_datetime(row["date"], row["time"])
+        if needs_action and sent and not any(i["id"] == key for i in state["open"]):
+            excerpt = " ".join(row["text"].split())[:80]
+            state["open"].append(
+                {"id": key, "room": room, "sender": row["sender"], "sent": sent.isoformat(),
+                 "category": row["category"], "text": excerpt}
+            )
+    state["seen"][room] = seen[-SEEN_PER_ROOM:]
+
+
+def overdue_items(state, now, hours):
+    limit = now - datetime.timedelta(hours=hours)
+    return sorted((i for i in state["open"] if datetime.datetime.fromisoformat(i["sent"]) <= limit), key=lambda i: i["sent"])
+
+
+def print_open_items(state, now, hours, me):
+    items = overdue_items(state, now, hours)
+    print(f"\n## 미처리 {len(state['open'])}건, 그중 {hours}시간 넘은 항목 {len(items)}건")
+    for item in items:
+        print(f"  - {item['id']} [{item['room']}] {item['sent']} {item['sender']}: {item['text']}")
+    if state["open"] and not me:
+        print("  주의: --me가 없어 내가 답해도 자동으로 닫히지 않습니다. 처리한 항목은 --done ID로 닫으세요.")
+
+
+def fetch_calendar_events(token, start, end, url=CALENDAR_URL):
+    """Read events from the primary Google Calendar. This only sends GET requests."""
+    events, page = [], None
+    while True:
+        query = {"timeMin": start.isoformat(), "timeMax": end.isoformat(), "singleEvents": "true", "orderBy": "startTime"}
+        if page:
+            query["pageToken"] = page
+        request = urllib.request.Request(
+            f"{url}?{urllib.parse.urlencode(query)}", headers={"Authorization": f"Bearer {token}"}
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = json.load(response)
+        except urllib.error.HTTPError as error:
+            hint = " 토큰이 만료됐는지 확인하세요." if error.code == 401 else ""
+            raise RuntimeError(f"캘린더 조회 실패: HTTP {error.code}.{hint}") from None
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise RuntimeError(f"캘린더 조회 실패: {type(error).__name__}") from None
+        events += data.get("items", [])
+        page = data.get("nextPageToken")
+        if not page:
+            return events
+
+
+def score_labels(results):
+    """Compare judgments with labels. Each result needs labels and answers; unlabeled fields are skipped."""
+    summary = {"total": len(results), "category": {}, "needs_reply": {}, "invoice": None}
+    labeled = [r for r in results if r.get("category")]
+    if labeled:
+        summary["category_accuracy"] = sum(r["category"] == r["got_category"] for r in labeled) / len(labeled)
+        for name in sorted({r["category"] for r in labeled} | {r["got_category"] for r in labeled}):
+            hits = sum(r["category"] == name == r["got_category"] for r in labeled)
+            actual = sum(r["category"] == name for r in labeled)
+            chosen = sum(r["got_category"] == name for r in labeled)
+            summary["category"][name] = {
+                "actual": actual,
+                "recall": hits / actual if actual else None,
+                "precision": hits / chosen if chosen else None,
+            }
+
+    def sweep(field, score):
+        rows = [r for r in results if isinstance(r.get(field), bool)]
+        table = {}
+        for threshold in EVALUATION_THRESHOLDS:
+            hits = sum(r[field] and r[score] >= threshold for r in rows)
+            actual = sum(r[field] for r in rows)
+            chosen = sum(r[score] >= threshold for r in rows)
+            table[threshold] = {
+                "missed": actual - hits,
+                "false_alarm": chosen - hits,
+                "recall": hits / actual if actual else None,
+                "precision": hits / chosen if chosen else None,
+            }
+        return table if rows else None
+
+    summary["needs_reply"] = sweep("needs_reply", "got_needs_reply")
+    summary["invoice"] = sweep("invoice", "got_invoice")
+    return summary
+
+
+def evaluate_file(path, key, rules):
+    """Judge labeled messages and score them. Rows are invented or chosen by the person running this."""
+    labels = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    questions = with_rules({**QUESTIONS, "invoice": INVOICE_QUESTION}, rules)
+
+    def one(item):
+        state = {
+            "room": item.get("room", "평가"),
+            "recent_messages": item.get("context", []),
+            "target": {"sender": item.get("sender", ""), "time": item.get("time", ""), "text": item["text"]},
+        }
+        answers = ask_jev(state, key, questions)["answers"]
+        return {
+            **item,
+            "got_category": answers["category"]["choice"],
+            "got_needs_reply": answers["needs_reply"]["noul"],
+            "got_invoice": answers["invoice"]["noul"],
+        }
+
+    with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
+        return list(pool.map(one, labels))
+
+
+def print_evaluation(results):
+    percent = lambda value: "-" if value is None else f"{value * 100:.0f}%"
+    summary = score_labels(results)
+    print(f"평가 메시지 {summary['total']}개 (적은 표본이면 숫자를 믿기 어렵습니다)")
+    if "category_accuracy" in summary:
+        print(f"\n분류 정확도 {percent(summary['category_accuracy'])}")
+        for name, row in summary["category"].items():
+            print(f"  {name}: 실제 {row['actual']}개, 찾은 비율 {percent(row['recall'])}, 맞은 비율 {percent(row['precision'])}")
+    for label, table in (("답장 필요", summary["needs_reply"]), ("세금계산서 요청", summary["invoice"])):
+        if table:
+            print(f"\n{label} 기준값별 결과")
+            for threshold, row in table.items():
+                print(f"  {threshold}: 놓침 {row['missed']}개, 잘못 잡음 {row['false_alarm']}개, 찾은 비율 {percent(row['recall'])}")
+    wrong = [r for r in results if r.get("category") and r["category"] != r["got_category"]]
+    if wrong:
+        print("\n분류가 다른 메시지")
+        for row in wrong:
+            print(f"  기대 {row['category']} / 판단 {row['got_category']}: {' '.join(row['text'].split())[:60]}")
+
+
+def reply_queue(rows, threshold):
+    """List messages needing a reply, with context, for drafting. Drafts stay empty until a person or Claude fills them."""
+    return [
+        {
+            "room": r["room"],
+            "sender": r["sender"],
+            "sent": f"{r['date']} {r['time']}",
+            "category": r["category"],
+            "needs_reply": r["needs_reply"],
+            "context": r.get("context", []),
+            "text": r["text"],
+            "draft": "",
+            "approved": False,
+        }
+        for r in rows
+        if "error" not in r and r["needs_reply"] >= threshold
+    ]
+
+
+def write_new_json(path, data):
+    """Refuse to overwrite: these files can hold edited drafts or labels."""
+    try:
+        with open(path, "x", encoding="utf-8") as output:
+            json.dump(data, output, ensure_ascii=False, indent=2)
+    except FileExistsError:
+        raise RuntimeError(f"이미 있는 파일입니다: {path}") from None
+
+
+def format_report(briefing, overdue, title):
+    """Build a one-line report. Line breaks are avoided because typed input could send them as Enter."""
+    sections = briefing["sections"]
+    parts = [f"{name} {len(items)}" for name, items in sections.items() if items]
+    if briefing["invoices"]:
+        parts.append(f"세금계산서 {len(briefing['invoices'])}")
+    if overdue:
+        parts.append(f"밀림 {len(overdue)}")
+    if briefing["failed"]:
+        parts.append(f"판단실패 {len(briefing['failed'])}")
+    text = f"[{title}] " + (", ".join(parts) or "확인할 항목 없음")
+    for name, items in sections.items():
+        for row in items:
+            excerpt = " ".join(row["text"].split())[:40]
+            text += f" / {name}: {row['room']} {row['sender']} {excerpt}"
+    if len(text) > REPORT_LIMIT:
+        text = text[: REPORT_LIMIT - 1] + "…"
+    return text
+
+
+def send_report(room, text):
+    """Send through kakaocli without --yes, so the person sees the text and must answer y."""
+    env = {**os.environ, "PYTHONUTF8": "1"}
+    sys.stdout.flush()
+    return subprocess.run([str(KAKAOCLI), "send", room, text, "--exact"], env=env).returncode
 
 
 def recent_indexes(messages, indexes, today, days):
@@ -533,17 +843,18 @@ def propose(row, events):
         return {**result, "reason": reason}
 
     today = parse_message_date(row["date"])
+    text = apply_aliases(row["text"], row.get("aliases"))
     if not today:
         return needs_check("메시지 날짜를 알 수 없음")
-    if TENTATIVE.search(row["text"]):
+    if TENTATIVE.search(text):
         return needs_check("확정되지 않은 표현")
-    date, clock, ambiguous = parse_when(row["text"], today)
+    date, clock, ambiguous = parse_when(text, today)
     if ambiguous:
         return needs_check("오전/오후를 알 수 없음")
     if not date and not clock:
         return needs_check("날짜나 시간을 찾지 못함")
 
-    event, tied = find_event(row["text"], events)
+    event, tied = find_event(text, events)
     if tied:
         return needs_check("비슷한 일정이 여러 개")
     if not event:
@@ -664,6 +975,162 @@ def self_check():
     assert [r["text"] for r in bucket(labeled, 0.5, ALL_CATEGORIES)[0]] == ["b", "a"]
 
     assert date_queries(datetime.date(2026, 3, 5)) == ["3월 5일", "3월5일", "3/5", "3.5", "5일"]
+
+    with tempfile.TemporaryDirectory() as folder:
+        folder = Path(folder)
+        assert load_config(folder / "none.json") == CONFIG_DEFAULTS
+        (folder / "c.json").write_text('{"me": "나", "rules": ["납기 변경은 문제"], "threshold": 1}', encoding="utf-8")
+        loaded = load_config(folder / "c.json", required=True)
+        assert loaded["me"] == "나" and loaded["rules"] == ["납기 변경은 문제"] and loaded["limit"] == 30
+        for bad in ('{"typo": 1}', '{"rooms": "방"}', "{"):
+            (folder / "c.json").write_text(bad, encoding="utf-8")
+            try:
+                load_config(folder / "c.json")
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError(f"bad config accepted: {bad}")
+        try:
+            load_config(folder / "none.json", required=True)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("an explicit missing config must fail")
+        state_file = folder / "sub" / "state.json"
+        assert load_state(state_file) == {"seen": {}, "open": []}
+        save_state(state_file, {"seen": {"방": ["a"]}, "open": []})
+        assert load_state(state_file)["seen"] == {"방": ["a"]}
+        state_file.write_text("{", encoding="utf-8")
+        try:
+            load_state(state_file)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("a corrupt state must not be treated as empty")
+        write_new_json(folder / "q.json", [])
+        try:
+            write_new_json(folder / "q.json", [1])
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("existing files must not be overwritten")
+        assert json.loads((folder / "q.json").read_text(encoding="utf-8")) == []
+
+    ruled = with_rules(QUESTIONS, ["납기 변경은 문제로 본다"])
+    assert "납기 변경은" in ruled["category"]["instructions"] and "회사 기준" not in QUESTIONS["category"]["instructions"]
+    assert with_rules(QUESTIONS, []) is QUESTIONS
+    assert apply_aliases("A사 대금", {"A": "X", "A사": "A상사"}) == "A상사 대금" and apply_aliases("글", None) == "글"
+    alias_row = {"room": "방", "sender": "김", "date": "2026년 11월 7일 토요일", "time": "오전 9:00",
+                 "text": "납회 오후 5시로 변경", "aliases": {"납회": "납품 회의"}}
+    alias_event = {"id": "e", "summary": "납품 회의", "start": {"dateTime": "2026-11-20T15:00:00+09:00"},
+                   "end": {"dateTime": "2026-11-20T15:30:00+09:00"}}
+    alias_result = propose(alias_row, [alias_event])
+    assert alias_result["status"] == "수정안" and alias_result["text"] == "납회 오후 5시로 변경"
+
+    pair = parse("2026년 11월 7일 토요일\n[김] [오전 9:00] 네\n[김] [오전 9:00] 네\n[김] [오후 12:30] 다른 말")
+    pair_keys = message_keys("방", pair)
+    assert len(set(pair_keys)) == 3 and pair_keys != message_keys("다른방", pair) and pair_keys == message_keys("방", pair)
+    assert "네" not in "".join(pair_keys)
+    assert message_datetime(pair[2].date, pair[2].time) == datetime.datetime(2026, 11, 7, 12, 30)
+    assert message_datetime("2026년 11월 7일", "오전 12:05") == datetime.datetime(2026, 11, 7, 0, 5)
+    assert message_datetime("", "오전 9:00") is None
+
+    track = {"seen": {}, "open": []}
+    base_row = {"date": "2026년 11월 7일 토요일", "time": "오전 9:00", "sender": "김", "room": "방"}
+    tracked_rows = [
+        {**base_row, "text": "승인?", "category": "결정", "needs_reply": 0.9},
+        {**base_row, "text": "안녕", "category": "잡담", "needs_reply": 0.9},
+        {**base_row, "text": "참고", "category": "요청", "needs_reply": 0.1},
+        {**base_row, "text": "실패", "error": "HTTP 500"},
+    ]
+    record_judged(track, "방", ["k1", "k2", "k3", "k4"], tracked_rows, 0.5)
+    assert track["seen"]["방"] == ["k1", "k2", "k3"], "a failed message must be retried"
+    assert [i["id"] for i in track["open"]] == ["k1"]
+    record_judged(track, "방", ["k1"], tracked_rows[:1], 0.5)
+    assert len(track["open"]) == 1
+    assert overdue_items(track, datetime.datetime(2026, 11, 7, 10), 24) == []
+    assert len(overdue_items(track, datetime.datetime(2026, 11, 8, 10), 24)) == 1
+    other_room = {"seen": {}, "open": [dict(track["open"][0], room="다른방"), *track["open"]]}
+    answered = parse("2026년 11월 7일 토요일\n[나] [오전 9:30] 네 승인합니다")
+    assert close_answered(other_room, "방", answered, "") == 0
+    assert close_answered(other_room, "방", answered, "모름") == 0
+    assert close_answered(other_room, "방", answered, "나") == 1 and other_room["open"][0]["room"] == "다른방"
+
+    results = [
+        {"text": "a", "category": "문제", "got_category": "문제", "needs_reply": True, "got_needs_reply": 0.9,
+         "invoice": False, "got_invoice": 0.1},
+        {"text": "b", "category": "문제", "got_category": "요청", "needs_reply": True, "got_needs_reply": 0.4,
+         "invoice": False, "got_invoice": 0.1},
+        {"text": "c", "category": "잡담", "got_category": "잡담", "needs_reply": False, "got_needs_reply": 0.6,
+         "invoice": True, "got_invoice": 0.8},
+        {"text": "d", "category": None, "got_category": "잡담", "needs_reply": None, "got_needs_reply": 0.9,
+         "invoice": None, "got_invoice": 0.9},
+    ]
+    scored = score_labels(results)
+    assert scored["category_accuracy"] == 2 / 3 and scored["category"]["문제"]["recall"] == 0.5
+    assert scored["needs_reply"][0.5] == {"missed": 1, "false_alarm": 1, "recall": 0.5, "precision": 0.5}
+    assert scored["needs_reply"][0.3]["missed"] == 0 and scored["invoice"][0.5]["recall"] == 1.0
+    assert score_labels([{"text": "x", "got_category": "잡담"}])["needs_reply"] is None
+
+    queue_rows = [
+        {**base_row, "text": "보내 주세요", "category": "요청", "needs_reply": 0.9, "context": [{"sender": "최", "text": "앞말"}]},
+        {**base_row, "text": "안녕", "category": "잡담", "needs_reply": 0.1},
+        {**base_row, "text": "실패", "error": "HTTP 500"},
+    ]
+    queued = reply_queue(queue_rows, 0.5)
+    assert len(queued) == 1 and queued[0]["draft"] == "" and queued[0]["approved"] is False
+    assert queued[0]["context"][0]["text"] == "앞말"
+
+    report_brief = {
+        "sections": {"문제": [{**base_row, "text": "장애\n둘째 줄"}], "결정": [], "요청": [], "질문": [], "일정": []},
+        "invoices": [{}], "failed": [],
+    }
+    report_text = format_report(report_brief, [{"id": "o"}], "제목")
+    assert "\n" not in report_text and "\r" not in report_text and "문제 1" in report_text and "밀림 1" in report_text
+    assert "장애 둘째 줄" in report_text
+    empty_brief = {"sections": {"문제": []}, "invoices": [], "failed": []}
+    assert "확인할 항목 없음" in format_report(empty_brief, [], "제목")
+    long_brief = {"sections": {"문제": [{**base_row, "text": "길다 " * 30}] * 60}, "invoices": [], "failed": []}
+    assert len(format_report(long_brief, [], "제목")) == REPORT_LIMIT
+
+    import http.server
+    import threading
+
+    pages = {None: {"items": [{"id": "1"}], "nextPageToken": "p2"}, "p2": {"items": [{"id": "2"}]}}
+    seen_requests = []
+
+    class Calendar(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            seen_requests.append((self.command, self.headers["Authorization"], query))
+            if self.headers["Authorization"] != "Bearer good":
+                self.send_error(401)
+                return
+            body = json.dumps(pages[query.get("pageToken", [None])[0]]).encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Calendar)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    fake_url = f"http://127.0.0.1:{server.server_port}/events"
+    span = datetime.datetime(2026, 11, 7, tzinfo=datetime.timezone.utc)
+    try:
+        fetched = fetch_calendar_events("good", span, span + datetime.timedelta(days=1), fake_url)
+        assert [e["id"] for e in fetched] == ["1", "2"]
+        assert all(r[0] == "GET" for r in seen_requests) and seen_requests[0][2]["singleEvents"] == ["true"]
+        try:
+            fetch_calendar_events("bad", span, span, fake_url)
+        except RuntimeError as error:
+            assert "토큰" in str(error)
+        else:
+            raise AssertionError("an expired token must fail")
+    finally:
+        server.shutdown()
+        server.server_close()
 
     now = datetime.date(2026, 11, 7)
     dated = parse(
@@ -817,7 +1284,7 @@ def self_check():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="열어 둔 카카오톡 방에서 답장이 필요한 메시지를 고릅니다. 전송 기능은 없습니다.")
+    parser = argparse.ArgumentParser(description="열어 둔 카카오톡 방의 메시지를 분류하고 확인할 항목을 정리합니다.")
     parser.add_argument("rooms", nargs="*", help="독립 창으로 열어 둔 방 이름")
     parser.add_argument("--all-open", action="store_true", help="열린 방 전체를 읽음")
     parser.add_argument("--me", default="", help="내 대화 이름. 내 마지막 메시지 이후만 판단")
@@ -833,6 +1300,18 @@ def main():
     parser.add_argument("--invoices", action="store_true", help="세금계산서 요청을 찾아 검토용 초안 출력. 발행은 하지 않음")
     parser.add_argument("--briefing", action="store_true", help="최근 메시지를 문제, 결정, 요청, 질문, 일정, 세금계산서로 정리")
     parser.add_argument("--days", type=int, default=1, help="브리핑 기간. 1이면 오늘만")
+    parser.add_argument("--config", help="설정 파일 경로. 기본은 사용자 폴더의 kakaocli-auto\\config.json")
+    parser.add_argument("--init-config", action="store_true", help="설정 파일 틀을 만들고 경로를 출력")
+    parser.add_argument("--track", action="store_true", help="이미 본 메시지를 건너뛰고 미처리 항목을 추적")
+    parser.add_argument("--overdue-hours", type=float, default=24, help="미처리 항목을 밀린 것으로 볼 시간")
+    parser.add_argument("--open-items", action="store_true", help="미처리 항목 목록만 출력. 카카오톡을 읽지 않음")
+    parser.add_argument("--done", nargs="+", metavar="ID", help="처리한 미처리 항목 닫기")
+    parser.add_argument("--evaluate", help="정답을 적은 JSON으로 정확도 측정. 메시지가 TypeSafe로 전송됨")
+    parser.add_argument("--make-labels", help="읽은 메시지로 정답 입력용 JSON 만들기. 외부 전송 없음")
+    parser.add_argument("--calendar", action="store_true", help="GOOGLE_CALENDAR_ACCESS_TOKEN으로 기본 캘린더를 읽어 일정 비교")
+    parser.add_argument("--calendar-days", type=int, default=30, help="--calendar로 읽을 앞으로의 일수")
+    parser.add_argument("--reply-queue", help="답장이 필요한 메시지를 초안 작성용 JSON으로 저장. 전송 없음")
+    parser.add_argument("--report-room", default="", help="브리핑 요약을 보낼 열린 방의 정확한 제목. y 입력 후에만 전송")
     parser.add_argument(
         "--date",
         type=datetime.date.fromisoformat,
@@ -841,26 +1320,81 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="외부 전송 없이 읽기와 파싱만 확인")
     parser.add_argument("--json", action="store_true", help="결과를 JSON으로 출력")
     parser.add_argument("--self-check", action="store_true", help="네트워크와 카카오톡 없이 로직 점검")
-    args = parser.parse_args()
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-    if args.self_check:
+    early, _unknown = parser.parse_known_args()
+    if early.self_check:
         return self_check()
+
+    config_path = Path(early.config) if early.config else DATA_DIR / "config.json"
+    if early.init_config:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            write_new_json(config_path, CONFIG_DEFAULTS)
+        except RuntimeError as error:
+            parser.error(str(error))
+        print(config_path)
+        return None
+    try:
+        config = load_config(config_path, required=bool(early.config))
+    except RuntimeError as error:
+        parser.error(str(error))
+    parser.set_defaults(**{name: config[name] for name in ARGUMENT_SETTINGS})
+    args = parser.parse_args()
+
+    state_path = DATA_DIR / "state.json"
+    now = datetime.datetime.now()
+    if args.open_items or args.done:
+        try:
+            state = load_state(state_path)
+        except RuntimeError as error:
+            parser.error(str(error))
+        if args.done:
+            unknown = set(args.done) - {i["id"] for i in state["open"]}
+            state["open"] = [i for i in state["open"] if i["id"] not in args.done]
+            save_state(state_path, state)
+            print(f"닫음 {len(args.done) - len(unknown)}건" + (f", 찾지 못한 ID: {', '.join(sorted(unknown))}" if unknown else ""))
+        print_open_items(state, now, args.overdue_hours, args.me)
+        return None
     if args.date:
         results = search_date(args.date)
         print(json.dumps(results, ensure_ascii=False, indent=2))
         return None
-    if bool(args.rooms) == args.all_open:
-        parser.error("방 이름 또는 --all-open 중 하나를 지정하세요.")
     key = os.environ.get("TYPESAFE_API_KEY", "")
-    if not args.dry_run and not key:
+    if args.evaluate:
+        if not key:
+            parser.error("TYPESAFE_API_KEY 환경 변수가 없습니다.")
+        print_evaluation(evaluate_file(args.evaluate, key, config["rules"]))
+        return None
+    if not args.rooms and not args.all_open:
+        args.rooms = config["rooms"]
+    if bool(args.rooms) == args.all_open:
+        parser.error("방 이름 또는 --all-open 중 하나를 지정하세요. 자주 보는 방은 설정 파일의 rooms에 넣을 수 있습니다.")
+    if not args.dry_run and not args.make_labels and not key:
         parser.error("TYPESAFE_API_KEY 환경 변수가 없습니다.")
     if args.days < 1:
         parser.error("--days는 1 이상이어야 합니다.")
+    if args.report_room and not args.briefing:
+        args.report_room = ""
+    if args.events and args.calendar:
+        parser.error("--events와 --calendar 중 하나만 지정하세요.")
     events = load_events(args.events) if args.events else None
+    if args.calendar and not args.dry_run and not args.make_labels:
+        token = os.environ.get("GOOGLE_CALENDAR_ACCESS_TOKEN", "")
+        if not token:
+            parser.error("GOOGLE_CALENDAR_ACCESS_TOKEN 환경 변수가 없습니다.")
+        start = now.astimezone()
+        try:
+            events = fetch_calendar_events(token, start, start + datetime.timedelta(days=args.calendar_days))
+        except RuntimeError as error:
+            parser.error(str(error))
     if events is not None and not args.briefing:
         args.category = "일정"
-    today = datetime.date.today()
+    today = now.date()
+    try:
+        state = load_state(state_path) if args.track else None
+    except RuntimeError as error:
+        parser.error(str(error))
+    label_rows = []
 
     open_rooms = run_kakaocli("rooms")
     targets = [(r["title"], True) for r in open_rooms] if args.all_open else [(r, False) for r in args.rooms]
@@ -875,19 +1409,57 @@ def main():
                 skipped.append((name, str(error)))
                 continue
             title = room["title"]
+            if args.make_labels:
+                label_rows += [
+                    {"room": title, "sender": m.sender, "time": m.time, "text": m.text,
+                     "category": None, "needs_reply": None, "invoice": None}
+                    for m in messages[-args.limit :]
+                ]
+                continue
+            keys = message_keys(title, messages)
             indexes = pending(messages, args.me)
             notes = []
             if args.briefing:
                 indexes, undated = recent_indexes(messages, indexes, today, args.days)
                 notes = coverage_notes(messages, today, args.days, len(indexes), args.limit, undated)
+            if state is not None:
+                seen = set(state["seen"].get(title, []))
+                indexes = [i for i in indexes if keys[i] not in seen]
+                if not args.dry_run:
+                    close_answered(state, title, messages, args.me)
             indexes = indexes[-args.limit :]
             rooms.append((title, len(messages), len(indexes), notes))
             if not args.dry_run:
-                rows += judge(title, messages, indexes, key, invoices=args.invoices or args.briefing)
+                judged = judge(title, messages, indexes, key, args.invoices or args.briefing, config["rules"])
+                for row in judged:
+                    row["aliases"] = config["aliases"]
+                rows += judged
+                if state is not None:
+                    record_judged(state, title, [keys[i] for i in indexes], judged, args.threshold)
     finally:
         clear_clipboard()
         if previous:
             bring_to_front(previous)
+
+    if args.make_labels:
+        try:
+            write_new_json(args.make_labels, label_rows)
+        except RuntimeError as error:
+            parser.error(str(error))
+        print(f"메시지 {len(label_rows)}개를 저장했습니다: {args.make_labels}")
+        for room, reason in skipped:
+            print(f"[{room}] 읽기 실패: {reason}")
+        print("category, needs_reply, invoice 값을 채운 뒤 --evaluate로 측정하세요.")
+        return
+    if state is not None and not args.dry_run:
+        save_state(state_path, state)
+    if args.reply_queue and not args.dry_run:
+        try:
+            queue = reply_queue(rows, args.threshold)
+            write_new_json(args.reply_queue, queue)
+            print(f"답장 초안 목록 {len(queue)}건을 저장했습니다: {args.reply_queue}")
+        except RuntimeError as error:
+            print(f"답장 초안 목록을 저장하지 못했습니다: {error}")
 
     if args.dry_run:
         for room, total, checked, notes in rooms:
@@ -902,12 +1474,23 @@ def main():
         schedule = [r for r in rows if r.get("category") == "일정"]
         proposals = None if events is None else [propose(row, events) for row in schedule]
         briefing = build_briefing(rows, args.threshold, proposals)
+        period = f"{today.isoformat()} 브리핑" if args.days == 1 else f"최근 {args.days}일 브리핑"
+        overdue = overdue_items(state, now, args.overdue_hours) if state is not None else []
         if args.json:
             coverage = [{"room": r, "read": t, "judged": c, "notes": n} for r, t, c, n in rooms]
-            print(json.dumps({**briefing, "rooms": coverage, "skipped": skipped}, ensure_ascii=False, indent=2))
+            output = {**briefing, "rooms": coverage, "skipped": skipped, "overdue": overdue}
+            print(json.dumps(output, ensure_ascii=False, indent=2))
         else:
-            period = f"{today.isoformat()} 브리핑" if args.days == 1 else f"최근 {args.days}일 브리핑"
             print_briefing(briefing, rooms, skipped, period)
+            if state is not None:
+                print_open_items(state, now, args.overdue_hours, args.me)
+        if args.report_room:
+            if not any(r["title"] == args.report_room for r in open_rooms):
+                print(f"보고를 보내지 않았습니다: '{args.report_room}' 창이 열려 있지 않습니다.")
+            else:
+                send_report(args.report_room, format_report(briefing, overdue, period))
+                if previous:
+                    bring_to_front(previous)
         return
 
     flagged, failed = bucket(rows, args.threshold, args.category or "")

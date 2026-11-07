@@ -131,7 +131,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 ## 메시지 분류와 일정 비교
 
-`kakao_triage.py`는 독립 창으로 열어 둔 방을 읽어 메시지를 분류합니다. 전송 기능은 없습니다. 분류에는 [TypeSafe](https://docs.typesafe.ai)의 Jev를 쓰므로 `TYPESAFE_API_KEY` 환경 변수가 필요합니다.
+`kakao_triage.py`는 독립 창으로 열어 둔 방을 읽어 메시지를 분류합니다. 메시지를 보내는 기능은 확인을 거치는 `--report-room`뿐입니다. 분류에는 [TypeSafe](https://docs.typesafe.ai)의 Jev를 쓰므로 `TYPESAFE_API_KEY` 환경 변수가 필요합니다.
 
 ```powershell
 # 외부 전송 없이 읽기만 확인
@@ -163,6 +163,71 @@ python .\kakao_triage.py --all-open --briefing --days 3 --scroll 20 --limit 100 
 ```
 
 브리핑은 독립 창으로 열어 둔 방만 읽습니다. 읽지 못한 방, 잘렸을 수 있는 범위, 판단에 실패한 메시지는 결과에 따로 표시되므로, 항목이 적을 때는 이 표시를 함께 확인하세요.
+
+### 설정
+
+```powershell
+# %LOCALAPPDATA%\kakaocli-auto\config.json 틀 만들기
+python .\kakao_triage.py --init-config
+```
+
+```json
+{
+  "rooms": ["방이름1", "방이름2"],
+  "me": "내 대화 이름",
+  "threshold": 0.5,
+  "limit": 30,
+  "days": 1,
+  "scroll": 0,
+  "overdue_hours": 24,
+  "report_room": "",
+  "rules": ["거래처의 납기 변경은 항상 문제로 분류한다"],
+  "aliases": {"A사": "A상사"}
+}
+```
+
+`rooms`를 넣으면 방 이름 없이 실행할 수 있고, 명령줄 옵션이 설정보다 우선합니다. `rules`는 Jev 판단에 함께 전달됩니다. `aliases`는 일정과 세금계산서 항목을 찾을 때만 쓰며, 화면에 보이는 메시지는 바꾸지 않습니다. 설정 파일은 저장소 밖에 있으니 회사 기준을 커밋할 걱정은 없습니다.
+
+### 중복 방지와 놓친 답장
+
+```powershell
+# 이미 본 메시지는 건너뛰고, 답장이나 조치가 필요한 항목을 추적
+python .\kakao_triage.py --briefing --track --me "내 대화 이름"
+
+# 미처리 항목 보기, 처리한 항목 닫기
+python .\kakao_triage.py --open-items
+python .\kakao_triage.py --done 항목ID
+```
+
+`--me`를 지정하면 내가 그 방에 답한 시각 이전의 항목은 자동으로 닫힙니다. 주제와 상관없이 닫히므로 한 방에서 여러 건이 오갈 때는 놓칠 수 있습니다. 기록은 `%LOCALAPPDATA%\kakaocli-auto\state.json`에 저장됩니다. 본 메시지는 해시로만 남지만, 미처리 항목은 찾아보기 쉽도록 보낸 사람과 메시지 앞부분 80자를 그대로 저장합니다.
+
+### 정확도 측정
+
+```powershell
+# 열린 방의 최근 메시지로 정답 입력 파일 만들기 (외부 전송 없음)
+python .\kakao_triage.py "방이름" --make-labels .\labels.json --limit 50
+
+# category, needs_reply, invoice를 채운 뒤 측정 (메시지가 TypeSafe로 전송됨)
+python .\kakao_triage.py --evaluate .\labels.json
+```
+
+분류별로 찾은 비율과 맞은 비율, 기준값별로 놓친 수와 잘못 잡은 수를 보여 줍니다. `labels.json`에는 대화 원문이 들어 있으니 저장소에 커밋하지 마세요.
+
+### 캘린더 직접 조회
+
+`GOOGLE_CALENDAR_ACCESS_TOKEN` 환경 변수에 읽기 권한이 있는 Google OAuth 액세스 토큰을 넣으면 `--events` 대신 `--calendar`로 기본 캘린더를 읽어 비교합니다. 읽기만 하고 수정은 하지 않습니다. 토큰 발급과 갱신은 직접 해야 합니다.
+
+### 답장 초안 목록과 보고 전송
+
+```powershell
+# 답장이 필요한 메시지와 앞뒤 맥락을 JSON으로 저장 (전송 없음)
+python .\kakao_triage.py "방이름" --reply-queue .\replies.json
+
+# 브리핑 요약을 열어 둔 방으로 보내기. 내용을 보여 주고 y를 입력해야 전송됨
+python .\kakao_triage.py --briefing --report-room "나와의 채팅 제목"
+```
+
+`replies.json`의 `draft`는 비어 있습니다. 직접 쓰거나 AI에게 맡긴 뒤 내용을 확인하고 `kakaocli send`로 보내세요. 이 도구가 답장을 자동으로 보내지는 않습니다. 보고에는 다른 방의 메시지 일부가 들어가므로 나와의 채팅으로 보내는 것을 권합니다.
 
 세금계산서 초안은 상호, 사업자번호, 공급가액, 세액, 합계, 작성일, 품목을 규칙으로 뽑고 사업자번호 검증 숫자와 세액 10%를 확인합니다. 빠지거나 불확실한 값은 추측하지 않고 `확인 필요`로 표시합니다. **이 도구는 세금계산서를 발행하지 않습니다.** 초안의 값을 확인한 뒤 쓰시는 서비스에서 직접 발행하세요. 공급자 정보는 다루지 않으며, 초안의 항목만으로 법적 필수 기재 사항이 모두 갖춰졌다고 보장하지 않습니다. 사업자번호와 금액이 든 메시지도 TypeSafe로 전송됩니다.
 
