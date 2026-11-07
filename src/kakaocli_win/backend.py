@@ -22,6 +22,11 @@ if os.name == "nt":
 CHAT_CLASS = "EVA_Window_Dblclk"
 INPUT_CLASSES = {"RICHEDIT50W", "RichEdit50W", "RichEditD2DPT"}
 FOCUS_TIMEOUT = 0.5
+MENU_MASK_KEY = 0xE8
+SEARCH_SETTLE = 0.8
+FIRST_ROW_Y = 30
+SCROLL_SETTLE = 0.15
+CHAT_LIST_VIEW = "ChatRoomListView"
 
 
 class KakaoError(RuntimeError):
@@ -145,18 +150,29 @@ def _focus(hwnd: int) -> None:
         if current_tid != target_tid:
             attached = bool(ctypes.windll.user32.AttachThreadInput(current_tid, target_tid, True))
         ctypes.windll.user32.BringWindowToTop(root)
-        # Windows silently ignores SetForegroundWindow from a background
-        # process unless a key event has just been seen.
-        win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
-        try:
-            ctypes.windll.user32.SetForegroundWindow(root)
-        finally:
-            win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+        foreground = win32gui.GetForegroundWindow()
+        if not (foreground and win32gui.GetAncestor(foreground, win32con.GA_ROOT) == root):
+            _set_foreground(root)
         ctypes.windll.user32.SetFocus(hwnd)
     finally:
         if attached:
             ctypes.windll.user32.AttachThreadInput(current_tid, target_tid, False)
     _require_foreground(root, timeout=FOCUS_TIMEOUT)
+
+
+def _set_foreground(root: int) -> None:
+    """Windows ignores SetForegroundWindow from a background process unless Alt is down.
+
+    A bare Alt tap toggles the target's menu mode, which swallows later keys, so
+    an unassigned key is pressed in between to keep the menu from activating.
+    """
+    win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+    try:
+        win32api.keybd_event(MENU_MASK_KEY, 0, 0, 0)
+        win32api.keybd_event(MENU_MASK_KEY, 0, win32con.KEYEVENTF_KEYUP, 0)
+        ctypes.windll.user32.SetForegroundWindow(root)
+    finally:
+        win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
 
 
 def _require_foreground(hwnd: int, *, timeout: float = 0.0) -> None:
@@ -270,6 +286,102 @@ def open_room(room: str, *, exact: bool = False, timeout: float = 3.0) -> Window
     )
 
 
+def _visible_hwnds() -> set[int]:
+    return {window.hwnd for window in list_windows() if window.visible}
+
+
+def _close_windows(hwnds: set[int]) -> None:
+    for hwnd in hwnds:
+        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+
+
+def _visible_children(hwnd: int) -> list[int]:
+    return [child for child in enum_children(hwnd) if win32gui.IsWindowVisible(child)]
+
+
+def _visible_edits(hwnd: int) -> list[int]:
+    return [child for child in _visible_children(hwnd) if win32gui.GetClassName(child) == "Edit"]
+
+
+def _chat_search_box(main_hwnd: int) -> int:
+    if not any(win32gui.GetWindowText(c).startswith(CHAT_LIST_VIEW) for c in _visible_children(main_hwnd)):
+        raise KakaoError("카카오톡 메인 창을 채팅 탭으로 바꾼 뒤 다시 실행하세요.")
+    edits = _visible_edits(main_hwnd)
+    if not edits:
+        before = _visible_hwnds()
+        _focus(main_hwnd)
+        _press(ord("F"), (win32con.VK_CONTROL,))
+        time.sleep(SEARCH_SETTLE)
+        # Ctrl+F can open the add-friend dialog instead of the search box.
+        unexpected = _visible_hwnds() - before
+        if unexpected:
+            _close_windows(unexpected)
+            raise KakaoError("검색창 대신 다른 창이 열려 닫았습니다. 카카오톡에서 방을 직접 열어 주세요.")
+        edits = _visible_edits(main_hwnd)
+    if len(edits) != 1:
+        raise KakaoError("채팅 검색창을 찾지 못했습니다. 카카오톡에서 방을 직접 열어 주세요.")
+    return edits[0]
+
+
+def _double_click_first_row(main_hwnd: int) -> None:
+    lists = [c for c in _visible_children(main_hwnd) if "ListControl" in win32gui.GetClassName(c)]
+    if len(lists) != 1:
+        raise KakaoError("채팅 목록을 찾지 못했습니다. 카카오톡에서 방을 직접 열어 주세요.")
+    left, _top, right, _bottom = win32gui.GetWindowRect(lists[0])
+    position = (FIRST_ROW_Y << 16) | ((right - left) // 2)
+    for message, buttons in (
+        (win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON),
+        (win32con.WM_LBUTTONUP, 0),
+        (win32con.WM_LBUTTONDBLCLK, win32con.MK_LBUTTON),
+        (win32con.WM_LBUTTONUP, 0),
+    ):
+        win32gui.PostMessage(lists[0], message, buttons, position)
+
+
+def search_and_open(room: str, *, timeout: float = 3.0) -> WindowInfo:
+    """Open the top chat-tab search result, keeping it only if its title equals `room`.
+
+    The result list cannot be read, so a wrong room may open briefly, which can
+    mark its messages as read. Rooms sharing the exact title cannot be told apart.
+    """
+    existing = find_room(room, exact=True)
+    if existing:
+        _focus(existing.hwnd)
+        return existing
+    main = find_main_window()
+    if not main:
+        raise KakaoError("카카오톡 메인 창을 찾지 못했습니다.")
+
+    search_box = _chat_search_box(main.hwnd)
+    before = _visible_hwnds()
+    # These messages target the controls directly, so nothing can reach another app.
+    # Arrow keys and Enter in the search box proved unreliable on KakaoTalk 26.9.
+    win32gui.SendMessage(search_box, win32con.WM_SETTEXT, 0, room)
+    try:
+        time.sleep(SEARCH_SETTLE)
+        _double_click_first_row(main.hwnd)
+        opened: list[WindowInfo] = []
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            opened = [w for w in list_windows() if w.visible and w.hwnd not in before]
+            if opened and all(w.title.strip() for w in opened):
+                break
+            time.sleep(0.1)
+    finally:
+        win32gui.SendMessage(search_box, win32con.WM_SETTEXT, 0, "")
+
+    if not opened:
+        raise KakaoError(f"{room!r} 방을 새로 열지 못했습니다. 이름을 확인하거나 카카오톡에서 직접 열어 주세요.")
+    if len(opened) == 1 and opened[0].kind == "chat" and opened[0].title.strip() == room.strip():
+        _focus(opened[0].hwnd)
+        return opened[0]
+    _close_windows({w.hwnd for w in opened})
+    raise KakaoError(
+        f"검색 결과의 첫 항목이 {room!r} 방이 아니어서 닫았습니다. "
+        "그 방의 메시지가 읽음으로 표시됐을 수 있습니다. 카카오톡에서 직접 열어 주세요."
+    )
+
+
 def send_message(room: str, message: str, *, exact: bool = False) -> WindowInfo:
     if not message:
         raise KakaoError("빈 메시지는 전송할 수 없습니다.")
@@ -291,7 +403,18 @@ def send_message(room: str, message: str, *, exact: bool = False) -> WindowInfo:
     return window
 
 
-def read_visible(room: str, *, exact: bool = False, timeout: float = 1.5) -> tuple[WindowInfo, str]:
+def _scroll_up(hwnd: int, ticks: int) -> None:
+    """Scroll the chat list toward older messages so KakaoTalk loads them."""
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    position = (((top + bottom) // 2 & 0xFFFF) << 16) | ((left + right) // 2 & 0xFFFF)
+    for _ in range(ticks):
+        win32gui.PostMessage(hwnd, win32con.WM_MOUSEWHEEL, win32con.WHEEL_DELTA << 16, position)
+        time.sleep(SCROLL_SETTLE)
+
+
+def read_visible(
+    room: str, *, exact: bool = False, timeout: float = 1.5, scroll: int = 0
+) -> tuple[WindowInfo, str]:
     import win32clipboard
 
     window = open_room(room, exact=exact)
@@ -309,6 +432,9 @@ def read_visible(room: str, *, exact: bool = False, timeout: float = 1.5) -> tup
         * max(0, win32gui.GetWindowRect(hwnd)[3] - win32gui.GetWindowRect(hwnd)[1]),
     )
     _focus(target)
+    if scroll > 0:
+        _scroll_up(target, scroll)
+        _focus(target)
     sequence = ctypes.windll.user32.GetClipboardSequenceNumber()
     _press(ord("A"), (win32con.VK_CONTROL,))
     _press(ord("C"), (win32con.VK_CONTROL,))

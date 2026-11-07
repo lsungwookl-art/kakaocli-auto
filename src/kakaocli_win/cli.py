@@ -16,6 +16,7 @@ from .backend import (
     list_windows,
     open_room,
     read_visible,
+    search_and_open,
     send_message,
     start_kakaotalk,
 )
@@ -55,16 +56,24 @@ def build_parser() -> argparse.ArgumentParser:
     open_parser = sub.add_parser("open", help="채팅방 검색 및 열기")
     open_parser.add_argument("room")
     open_parser.add_argument("--exact", action="store_true")
+    open_parser.add_argument(
+        "--search", action="store_true", help="닫힌 방을 채팅 탭에서 검색해 열기. 제목이 정확히 같을 때만 유지"
+    )
 
     read_parser = sub.add_parser("read", help="열린 화면에 보이는 대화 복사")
     read_parser.add_argument("room")
     read_parser.add_argument("--exact", action="store_true")
+    read_parser.add_argument("--scroll", type=int, default=0, help="읽기 전에 위로 스크롤할 횟수. 과거 대화를 불러옴")
 
     send_parser = sub.add_parser("send", help="채팅방에 메시지 전송")
     send_parser.add_argument("room")
     send_parser.add_argument("message")
     send_parser.add_argument("--exact", action="store_true")
-    send_parser.add_argument("--yes", action="store_true", help="확인 질문 생략")
+    send_confirmation = send_parser.add_mutually_exclusive_group()
+    send_confirmation.add_argument("--yes", action="store_true", help="확인 질문 생략")
+    send_confirmation.add_argument(
+        "--open", action="store_true", help="닫힌 방을 검색해 연 뒤 확인을 거쳐 전송. --yes와 함께 쓸 수 없음"
+    )
     send_parser.add_argument("--dry-run", action="store_true", help="대상과 내용을 출력하고 전송하지 않음")
 
     send_self_parser = sub.add_parser(
@@ -132,9 +141,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "rooms":
             result = [window.to_dict() for window in list_rooms()]
         elif args.command == "open":
-            result = {"opened": open_room(args.room, exact=args.exact).to_dict()}
+            window = search_and_open(args.room) if args.search else open_room(args.room, exact=args.exact)
+            result = {"opened": window.to_dict()}
         elif args.command == "read":
-            window, text = read_visible(args.room, exact=args.exact)
+            window, text = read_visible(args.room, exact=args.exact, scroll=args.scroll)
             result = {"room": window.title, "text": text}
         elif args.command == "inspect":
             result = inspect_tree(args.room)
@@ -277,10 +287,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.dry_run:
                 result = {"sent": False, "dry_run": True, **preview}
             else:
-                if not confirm_send(args.room, args.message, skip=args.yes):
+                # With --open, confirm after opening so the person can check the actual room.
+                room, exact = (search_and_open(args.room).title, True) if args.open else (args.room, args.exact)
+                if not confirm_send(room, args.message, skip=args.yes):
                     emit({"sent": False, "cancelled": True}, as_json=args.json)
                     return 2
-                window = send_message(args.room, args.message, exact=args.exact)
+                window = send_message(room, args.message, exact=exact)
                 result = {"sent": True, "room": window.title, "message": args.message}
         else:
             parser.error("알 수 없는 명령")

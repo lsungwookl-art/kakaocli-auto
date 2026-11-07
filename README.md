@@ -58,8 +58,17 @@ Set-ExecutionPolicy -Scope Process Bypass
 # 이미 독립 창으로 열린 채팅방 포커스
 .\kakaocli.cmd open "홍길동"
 
+# 닫힌 방을 채팅 탭에서 검색해 열기 (제목이 정확히 같을 때만 유지)
+.\kakaocli.cmd open "홍길동" --search
+
+# 닫힌 방을 검색해 연 뒤, 확인 질문을 거쳐 전송
+.\kakaocli.cmd send "홍길동" "테스트입니다" --open
+
 # 화면에 로드된 대화 읽기
 .\kakaocli.cmd read "홍길동"
+
+# 위로 40회 스크롤해 과거 대화까지 읽기
+.\kakaocli.cmd read "홍길동" --scroll 40
 
 # 실제 전송 전 점검
 .\kakaocli.cmd send "홍길동" "테스트입니다" --dry-run
@@ -115,7 +124,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 카카오톡은 버전에 따라 내부 컨트롤 클래스가 달라질 수 있습니다. 아래 결과를 파일로 저장하면 선택자 조정에 사용할 수 있습니다.
 
-현재 확인된 카카오톡 버전에서는 친구 탭의 `Ctrl+F`가 검색이 아니라 친구 추가를 열기 때문에, 닫힌 채팅방을 CLI가 자동 검색하지 않습니다. 읽기나 전송 전 PC 카카오톡에서 대상 방을 직접 독립 창으로 열어 두세요.
+현재 확인된 카카오톡 버전에서는 친구 탭의 `Ctrl+F`가 검색이 아니라 친구 추가를 열 수 있어, 닫힌 채팅방 자동 검색은 `open --search`와 `send --open`을 지정할 때만 동작합니다. 메인 창을 채팅 탭으로 둬야 합니다.
+
+검색 결과 목록은 읽을 수 없어 첫 줄을 엽니다. 제목이 정확히 일치하지 않으면 창을 닫고 중단하지만, 그 사이 다른 방의 메시지가 읽음으로 표시될 수 있습니다. 제목이 완전히 같은 방은 구별하지 못하므로, 민감한 방은 직접 독립 창으로 열어 두세요. 같은 이유로 `send --open`은 `--yes`와 함께 쓸 수 없습니다.
 
 ```powershell
 .\kakaocli.cmd --json inspect > main-controls.json
