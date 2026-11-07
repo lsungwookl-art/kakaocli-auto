@@ -98,6 +98,57 @@ def test_open_room_requires_manual_open_when_not_found(monkeypatch):
         backend.open_room("개발팀", exact=True)
 
 
+@pytest.fixture
+def focus_env(monkeypatch):
+    """Fake window APIs so no real key reaches the desktop; returns the keys that _press sent."""
+    pressed = []
+    monkeypatch.setattr(backend, "FOCUS_TIMEOUT", 0)
+    monkeypatch.setattr(backend, "find_room", lambda *_a, **_k: make_window("개발팀", 111))
+    monkeypatch.setattr(backend, "_press", lambda vk, modifiers=(): pressed.append(vk))
+    monkeypatch.setattr(backend, "_input_handles", lambda _hwnd: [111])
+    monkeypatch.setattr(backend, "enum_children", lambda _hwnd: [111])
+    monkeypatch.setattr(backend, "_set_text", lambda _hwnd, _text: True)
+    monkeypatch.setattr(backend.win32gui, "GetClassName", lambda _hwnd: "EVA_VH_ListControl_Dblclk")
+    monkeypatch.setattr(backend.win32gui, "GetWindowRect", lambda _hwnd: (0, 0, 10, 10))
+    monkeypatch.setattr(backend.win32gui, "GetAncestor", lambda hwnd, _flag: hwnd)
+    monkeypatch.setattr(backend.win32gui, "ShowWindow", lambda *_a: None)
+    monkeypatch.setattr(backend.win32api, "keybd_event", lambda *_a: None)
+    monkeypatch.setattr(
+        backend.win32process,
+        "GetWindowThreadProcessId",
+        lambda _hwnd: (backend.win32api.GetCurrentThreadId(), 0),
+    )
+    return pressed
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        lambda: backend.send_message("개발팀", "테스트"),
+        lambda: backend.read_visible("개발팀"),
+    ],
+)
+def test_no_keys_are_pressed_when_room_is_not_in_front(focus_env, monkeypatch, action):
+    monkeypatch.setattr(backend.win32gui, "GetForegroundWindow", lambda: 999)
+    with pytest.raises(KakaoError, match="맨 앞"):
+        action()
+    assert focus_env == []
+
+
+def test_foreground_lost_before_enter_does_not_send(focus_env, monkeypatch):
+    fronts = iter([111, 111, 999])
+    monkeypatch.setattr(backend.win32gui, "GetForegroundWindow", lambda: next(fronts))
+    with pytest.raises(KakaoError, match="맨 앞"):
+        backend.send_message("개발팀", "테스트")
+    assert backend.win32con.VK_RETURN not in focus_env
+
+
+def test_require_foreground_passes_for_child_of_room(focus_env, monkeypatch):
+    monkeypatch.setattr(backend.win32gui, "GetForegroundWindow", lambda: 222)
+    monkeypatch.setattr(backend.win32gui, "GetAncestor", lambda _hwnd, _flag: 111)
+    backend._require_foreground(333)
+
+
 def test_set_text_falls_back_to_replace_selection(monkeypatch):
     state = {"text": ""}
 

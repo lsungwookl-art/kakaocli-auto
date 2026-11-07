@@ -21,6 +21,7 @@ if os.name == "nt":
 
 CHAT_CLASS = "EVA_Window_Dblclk"
 INPUT_CLASSES = {"RICHEDIT50W", "RichEdit50W", "RichEditD2DPT"}
+FOCUS_TIMEOUT = 0.5
 
 
 class KakaoError(RuntimeError):
@@ -144,11 +145,34 @@ def _focus(hwnd: int) -> None:
         if current_tid != target_tid:
             attached = bool(ctypes.windll.user32.AttachThreadInput(current_tid, target_tid, True))
         ctypes.windll.user32.BringWindowToTop(root)
-        ctypes.windll.user32.SetForegroundWindow(root)
+        # Windows silently ignores SetForegroundWindow from a background
+        # process unless a key event has just been seen.
+        win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+        try:
+            ctypes.windll.user32.SetForegroundWindow(root)
+        finally:
+            win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
         ctypes.windll.user32.SetFocus(hwnd)
     finally:
         if attached:
             ctypes.windll.user32.AttachThreadInput(current_tid, target_tid, False)
+    _require_foreground(root, timeout=FOCUS_TIMEOUT)
+
+
+def _require_foreground(hwnd: int, *, timeout: float = 0.0) -> None:
+    """Refuse to continue: keyboard events go to whichever window is in front."""
+    root = win32gui.GetAncestor(hwnd, win32con.GA_ROOT) or hwnd
+    deadline = time.monotonic() + timeout
+    while True:
+        foreground = win32gui.GetForegroundWindow()
+        if foreground and win32gui.GetAncestor(foreground, win32con.GA_ROOT) == root:
+            return
+        if time.monotonic() >= deadline:
+            raise KakaoError(
+                "카카오톡 창을 맨 앞으로 가져오지 못해 키 입력 없이 중단했습니다. "
+                "채팅방 창을 한 번 클릭한 뒤 다시 실행하세요."
+            )
+        time.sleep(0.05)
 
 
 def _press(vk: int, modifiers: tuple[int, ...] = ()) -> None:
@@ -258,6 +282,7 @@ def send_message(room: str, message: str, *, exact: bool = False) -> WindowInfo:
     _focus(input_hwnd)
     if not _set_text(input_hwnd, message):
         raise KakaoError("메시지 입력에 실패했습니다. 전송하지 않았습니다.")
+    _require_foreground(window.hwnd)
     _press(win32con.VK_RETURN)
     time.sleep(0.2)
     remaining = win32gui.GetWindowText(input_hwnd)
