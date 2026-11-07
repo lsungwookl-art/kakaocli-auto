@@ -12,6 +12,7 @@ import concurrent.futures
 import ctypes
 import dataclasses
 import datetime
+import decimal
 import json
 import os
 import re
@@ -50,6 +51,23 @@ QUESTIONS = {
     },
 }
 
+INVOICE_QUESTION = {
+    "type": "noul",
+    "instructions": "state의 target 메시지는 세금계산서를 발행하거나 수정해 달라는 요청인가? 담당자를 묻거나 발행 완료를 알리는 말은 해당하지 않는다.",
+}
+INVOICE_FOLLOWING = 3
+MONEY_UNITS = {"억": 10**8, "천만": 10**7, "백만": 10**6, "십만": 10**5, "만": 10**4, "천": 10**3}
+MONEY = r"\d[\d,]*(?:\.\d+)?\s*(?:억|천만|백만|십만|만|천)?(?:\s*\d[\d,]*\s*(?:천만|백만|십만|만|천))*"
+MONEY_LABELS = {
+    "supply": r"공급가액|공급가|공급금액",
+    "tax": r"세액|부가세|부가가치세|VAT",
+    "total": r"합계금액|합계|총액|총 금액|총금액|총",
+}
+COMPANY = (
+    r"(?:\(주\)|㈜|주식회사\s*)[A-Za-z0-9가-힣]+"
+    r"|[A-Za-z0-9가-힣]+(?:\(주\)|㈜|주식회사)"
+    r"|[A-Za-z0-9가-힣]*(?:상사|전자|건설|산업|기업|물산|테크|유통|상회|컴퍼니)(?![가-힣])"
+)
 ALL_CATEGORIES = "전체"
 TENTATIVE = re.compile(r"쯤|아직|미정|확정.{0,3}아|확정 전|것 같|듯합|듯해|잡을까|될까요|할까요|어떨까|어때|괜찮을까|\?")
 DATE_LINE = re.compile(r"^\d{4}년 \d{1,2}월 \d{1,2}일")
@@ -164,8 +182,8 @@ def build_state(room, messages, index):
     }
 
 
-def ask_jev(state, key):
-    body = json.dumps({"model": "jev-latest", "state": state, "questions": QUESTIONS}).encode("utf-8")
+def ask_jev(state, key, questions=QUESTIONS):
+    body = json.dumps({"model": "jev-latest", "state": state, "questions": questions}).encode("utf-8")
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": "kakao-triage/0.1"}
     for attempt in range(RETRIES + 1):
         try:
@@ -181,20 +199,232 @@ def ask_jev(state, key):
         time.sleep(2**attempt)
 
 
-def judge(room, messages, indexes, key):
+def following_from_sender(messages, index):
+    """Details often arrive in the sender's next few messages, so keep them with the request."""
+    following = []
+    for message in messages[index + 1 : index + 1 + INVOICE_FOLLOWING]:
+        if message.sender != messages[index].sender:
+            break
+        following.append(message.text)
+    return following
+
+
+def judge(room, messages, indexes, key, invoices=False):
+    questions = {**QUESTIONS, "invoice": INVOICE_QUESTION} if invoices else QUESTIONS
+
     def one(index):
         message = messages[index]
         row = {"room": room, "date": message.date, "time": message.time, "sender": message.sender, "text": message.text}
         try:
-            answers = ask_jev(build_state(room, messages, index), key)["answers"]
+            answers = ask_jev(build_state(room, messages, index), key, questions)["answers"]
             row["needs_reply"] = answers["needs_reply"]["noul"]
             row["category"] = answers["category"]["choice"]
+            if invoices:
+                row["invoice"] = answers["invoice"]["noul"]
+                row["following"] = following_from_sender(messages, index)
         except (RuntimeError, KeyError, TypeError, ValueError) as error:
             row["error"] = str(error) or type(error).__name__
         return row
 
     with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
         return list(pool.map(one, indexes))
+
+
+def valid_business_number(number):
+    digits = [int(c) for c in number if c.isdigit()]
+    if len(digits) != 10:
+        return False
+    weights = (1, 3, 7, 1, 3, 7, 1, 3, 5)
+    total = sum(d * w for d, w in zip(digits, weights)) + digits[8] * 5 // 10
+    return (10 - total % 10) % 10 == digits[9]
+
+
+def parse_money(text):
+    """Convert '1,100,000', '110만', '1억 2천만' to won. Returns None for anything it cannot read exactly."""
+    total, last_end = 0, 0
+    found = False
+    for match in re.finditer(r"(\d[\d,]*(?:\.\d+)?)\s*(억|천만|백만|십만|만|천)?", text):
+        if text[last_end : match.start()].strip():
+            return None
+        value = decimal.Decimal(match[1].replace(",", "")) * MONEY_UNITS.get(match[2], 1)
+        if value != int(value):
+            return None
+        total, last_end, found = total + int(value), match.end(), True
+    return total if found and not text[last_end:].strip() else None
+
+
+def extract_invoice(text, today):
+    """Pull invoice fields from a message by rule. A value it cannot read stays empty and is listed as missing."""
+    # ponytail: rules cover common phrasing only. A missing value is reported, never guessed.
+    fields = {"company": None, "representative": None, "business_number": None, "item": None, "email": None}
+    warnings = []
+
+    numbers = sorted(set(re.findall(r"(?<!\d)\d{3}-?\d{2}-?\d{5}(?!\d)", text)))
+    if len(numbers) > 1:
+        warnings.append("사업자번호가 여러 개")
+    elif numbers:
+        fields["business_number"] = numbers[0]
+        if not valid_business_number(numbers[0]):
+            warnings.append("사업자번호 검증 숫자가 맞지 않음")
+
+    company = re.search(COMPANY, text)
+    fields["company"] = company[0].strip() if company else None
+    person = re.search(r"대표(?:자|자명)?\s*[:：]?\s*([가-힣]{2,4})(?:님|씨)?(?![가-힣])", text)
+    fields["representative"] = person[1] if person else None
+    email = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text)
+    fields["email"] = email[0] if email else None
+    item = re.search(r"(?:품목|품명|내역)\s*[:：은는]?\s*([^\n,.]+)", text) or re.search(
+        r"(\d{1,2}월분?\s*[가-힣]+|[가-힣]+)\s*(?:건|대금|비용)(?![가-힣])", text
+    )
+    fields["item"] = item[1].strip() if item else None
+
+    basis_match = re.search(r"(?:부가세|부가가치세|VAT)\s*(별도|포함)", text, re.IGNORECASE)
+    basis = basis_match[1] if basis_match else None
+    body = re.sub(r"(?:부가세|부가가치세|VAT)\s*(?:별도|포함)", " ", text, flags=re.IGNORECASE)
+
+    labeled = {}
+    for label, pattern in MONEY_LABELS.items():
+        match = re.search(rf"(?:{pattern})\s*(?:은|는|이|가|:|：)?\s*({MONEY})\s*원?", body)
+        if match:
+            labeled[label] = parse_money(match[1])
+            body = body.replace(match[0], " ")
+    loose = [parse_money(m) for m in re.findall(rf"({MONEY})\s*원", body)]
+
+    supply, tax, total = labeled.get("supply"), labeled.get("tax"), labeled.get("total")
+    if not labeled and len(loose) > 1:
+        warnings.append("금액이 여러 개")
+    elif not labeled and len(loose) == 1:
+        if basis == "별도":
+            supply = loose[0]
+        elif basis == "포함":
+            total = loose[0]
+        else:
+            total = None
+            warnings.append(f"부가세 포함 여부를 알 수 없음 (금액 {loose[0]:,}원)")
+    if total is not None and supply is None:
+        supply = round(total / 1.1) if tax is None else total - tax
+    if supply is not None and tax is None:
+        tax = supply // 10 if total is None else total - supply
+    if supply is not None and tax is not None:
+        if total is not None and supply + tax != total:
+            warnings.append("공급가액과 세액의 합이 합계와 다름")
+        if abs(tax - supply // 10) > 1:
+            warnings.append("세액이 공급가액의 10%와 다름 (영세율, 면세 등 확인)")
+        total = supply + tax if total is None else total
+
+    date = parse_when(text, today)[0] if today else None
+    draft = {**fields, "supply": supply, "tax": tax, "total": total, "date": date.isoformat() if date else None}
+    required = {"company": "상호", "business_number": "사업자번호", "supply": "공급가액", "date": "작성일"}
+    missing = [name for key, name in required.items() if draft[key] is None]
+    return draft, missing, warnings
+
+
+def draft_invoice(row):
+    """Build a review draft from one message. Issuing is deliberately not implemented."""
+    text = "\n".join([row["text"], *row.get("following", [])])
+    draft, missing, warnings = extract_invoice(text, parse_message_date(row["date"]))
+    return {
+        "status": "확인 필요" if missing or warnings else "초안",
+        "room": row["room"],
+        "sender": row["sender"],
+        "sent": f"{row['date']} {row['time']}",
+        "text": text,
+        **draft,
+        "missing": missing,
+        "warnings": warnings,
+    }
+
+
+def print_invoices(drafts):
+    print(f"\n세금계산서 초안 {len(drafts)}건 (발행하지 않음. 값을 확인한 뒤 직접 발행하세요)")
+    won = lambda value: f"{value:,}원" if value is not None else "-"
+    for item in drafts:
+        print(f"  [{item['status']}] [{item['room']}] {item['sent']} {item['sender']}: {' '.join(item['text'].split())[:60]}")
+        print(f"      상호 {item['company'] or '-'} | 대표 {item['representative'] or '-'} | 사업자번호 {item['business_number'] or '-'}")
+        print(f"      공급가액 {won(item['supply'])} | 세액 {won(item['tax'])} | 합계 {won(item['total'])}")
+        print(f"      작성일 {item['date'] or '-'} | 품목 {item['item'] or '-'} | 이메일 {item['email'] or '-'}")
+        if item["missing"]:
+            print(f"      빠진 항목: {', '.join(item['missing'])}")
+        for warning in item["warnings"]:
+            print(f"      주의: {warning}")
+
+
+def recent_indexes(messages, indexes, today, days):
+    """Keep messages from the last `days` days. Returns kept indexes and how many had no readable date."""
+    cutoff = today - datetime.timedelta(days=days - 1)
+    kept, undated = [], 0
+    for index in indexes:
+        date = parse_message_date(messages[index].date)
+        if date is None:
+            undated += 1
+        elif date >= cutoff:
+            kept.append(index)
+    return kept, undated
+
+
+def coverage_notes(messages, today, days, recent, limit, undated):
+    """Say what the briefing may have missed, so a short list is not mistaken for a quiet day."""
+    notes = []
+    oldest = parse_message_date(messages[0].date) if messages else None
+    if oldest and oldest >= today - datetime.timedelta(days=days - 1):
+        notes.append("읽은 범위가 기간 시작 전까지 닿지 않았을 수 있음. --scroll로 늘려 확인")
+    if undated:
+        notes.append(f"날짜를 알 수 없는 메시지 {undated}개 제외")
+    if recent > limit:
+        notes.append(f"메시지 {recent}개 중 최근 {limit}개만 판단. --limit으로 늘려 확인")
+    return notes
+
+
+def build_briefing(rows, threshold, proposals=None):
+    """Sort judged messages into action sections. Failed messages stay out of the counts and are listed apart."""
+    judged = [r for r in rows if "error" not in r]
+    invoices = [draft_invoice(r) for r in judged if r.get("invoice", 0) >= threshold]
+    invoice_rows = {id(r) for r in judged if r.get("invoice", 0) >= threshold}
+    section = lambda name, needs_reply=False: [
+        r
+        for r in judged
+        if r["category"] == name and id(r) not in invoice_rows and (not needs_reply or r["needs_reply"] >= threshold)
+    ]
+    sections = {
+        "문제": section("문제"),
+        "결정": section("결정"),
+        "요청": section("요청", needs_reply=True),
+        "질문": section("질문", needs_reply=True),
+        "일정": section("일정"),
+    }
+    shown = {id(r) for items in sections.values() for r in items} | invoice_rows
+    return {
+        "sections": sections,
+        "invoices": invoices,
+        "proposals": proposals,
+        "other": sum(id(r) not in shown for r in judged),
+        "failed": [r for r in rows if "error" in r],
+    }
+
+
+def print_briefing(briefing, rooms, skipped, title):
+    print(f"# {title}")
+    for room, total, checked, notes in rooms:
+        print(f"[{room}] 읽음 {total}개, 판단 {checked}개")
+        for note in notes:
+            print(f"  주의: {note}")
+    for room, reason in skipped:
+        print(f"[{room}] 읽기 실패, 브리핑에 포함되지 않음: {reason}")
+    count = sum(len(items) for items in briefing["sections"].values()) + len(briefing["invoices"])
+    print(f"\n확인할 항목 {count}개, 그 밖의 메시지 {briefing['other']}개")
+    for name, items in briefing["sections"].items():
+        if items:
+            print(f"\n## {name} {len(items)}건")
+        for row in items:
+            print(f"  - [{row['room']}] {row['time']} {row['sender']}: {' '.join(row['text'].split())[:80]}")
+    if briefing["proposals"]:
+        print_proposals(briefing["proposals"])
+    if briefing["invoices"]:
+        print_invoices(briefing["invoices"])
+    if briefing["failed"]:
+        print(f"\n## 판단 실패 {len(briefing['failed'])}건: 직접 확인하세요")
+        for row in briefing["failed"]:
+            print(f"  - [{row['room']}] {row['time']} {row['sender']} ({row['error']})")
 
 
 def date_queries(date):
@@ -382,7 +612,7 @@ def bucket(rows, threshold, category=""):
 
 
 def report(rooms, flagged, failed, skipped, threshold, category=""):
-    for room, total, checked in rooms:
+    for room, total, checked, _notes in rooms:
         print(f"[{room}] 읽음 {total}개, 판단 대상 {checked}개")
     for room, reason in skipped:
         print(f"[{room}] 읽기 실패: {reason}")
@@ -434,6 +664,91 @@ def self_check():
     assert [r["text"] for r in bucket(labeled, 0.5, ALL_CATEGORIES)[0]] == ["b", "a"]
 
     assert date_queries(datetime.date(2026, 3, 5)) == ["3월 5일", "3월5일", "3/5", "3.5", "5일"]
+
+    now = datetime.date(2026, 11, 7)
+    dated = parse(
+        "[없음] [오전 8:00] 날짜 줄 이전\n2026년 11월 5일 목요일\n[김] [오전 9:00] 그저께\n"
+        "2026년 11월 6일 금요일\n[김] [오전 9:00] 어제\n2026년 11월 7일 토요일\n[김] [오전 9:00] 오늘"
+    )
+    every = list(range(len(dated)))
+    assert recent_indexes(dated, every, now, 1) == ([3], 1)
+    assert recent_indexes(dated, every, now, 2) == ([2, 3], 1)
+    assert coverage_notes(dated[3:], now, 1, 1, 30, 0)[0].startswith("읽은 범위")
+    assert coverage_notes(dated[1:], now, 1, 1, 30, 0) == []
+    assert "최근 30개" in coverage_notes(dated[1:], now, 1, 40, 30, 0)[0]
+    assert "1개 제외" in coverage_notes(dated[1:], now, 1, 1, 30, 1)[0]
+
+    def judged(text, category, reply=0.1, invoice=0.0):
+        return {
+            "room": "방", "date": "2026년 11월 7일 토요일", "time": "오전 9:00", "sender": "김", "text": text,
+            "category": category, "needs_reply": reply, "invoice": invoice,
+        }
+
+    brief = build_briefing(
+        [
+            judged("장애", "문제"),
+            judged("승인?", "결정"),
+            judged("보내 주세요", "요청", reply=0.9),
+            judged("참고로 요청", "요청", reply=0.1),
+            judged("몇 시?", "질문", reply=0.8),
+            judged("수요일 이동", "일정"),
+            judged("안녕", "잡담"),
+            judged("공유", "정보"),
+            judged("A상사 부가세 별도 100만원 계산서", "요청", reply=0.9, invoice=0.9),
+            {"room": "방", "time": "오전 9:00", "sender": "김", "text": "실패", "error": "HTTP 500"},
+        ],
+        0.5,
+    )
+    assert {k: [r["text"] for r in v] for k, v in brief["sections"].items()} == {
+        "문제": ["장애"], "결정": ["승인?"], "요청": ["보내 주세요"], "질문": ["몇 시?"], "일정": ["수요일 이동"],
+    }
+    assert len(brief["invoices"]) == 1 and brief["other"] == 3 and len(brief["failed"]) == 1
+
+    assert valid_business_number("123-45-67891") and valid_business_number("1234567891")
+    assert not valid_business_number("123-45-67890") and not valid_business_number("123-45-6789")
+    for text, won in [
+        ("1,100,000", 1100000), ("110만", 1100000), ("1억 2천만", 120000000), ("5천", 5000),
+        ("1.5만", 15000), ("1.1만", 11000), ("3백만", 3000000), ("1.23456만", None), ("abc", None), ("", None),
+    ]:
+        assert parse_money(text) == won, text
+    day_of = datetime.date(2026, 11, 7)
+    fields, missing, warnings = extract_invoice(
+        "A상사 대표 김철수 사업자번호 123-45-67891 품목: 3월 납품 공급가액 1,000,000원 11월 20일 발행 a@b.co.kr", day_of
+    )
+    assert (fields["supply"], fields["tax"], fields["total"]) == (1000000, 100000, 1100000)
+    assert fields["company"] == "A상사" and fields["representative"] == "김철수"
+    assert fields["date"] == "2026-11-20" and fields["email"] == "a@b.co.kr"
+    assert "3월 납품" in fields["item"] and not missing and not warnings
+    for text, supply, tax, total in [
+        ("부가세 별도 100만원", 1000000, 100000, 1100000),
+        ("부가세 포함 110만원", 1000000, 100000, 1100000),
+        ("VAT 포함 33,000원", 30000, 3000, 33000),
+        ("공급가액 100만원 세액 10만원 합계 110만원", 1000000, 100000, 1100000),
+    ]:
+        fields, _missing, warnings = extract_invoice(text, day_of)
+        assert (fields["supply"], fields["tax"], fields["total"]) == (supply, tax, total), text
+        assert not warnings, (text, warnings)
+    for text, warning in [
+        ("100만원 발행해 주세요", "부가세 포함 여부"),
+        ("100만원이랑 200만원 발행", "금액이 여러 개"),
+        ("공급가액 100만원 세액 5만원", "10%와 다름"),
+        ("공급가액 100만원 세액 10만원 합계 120만원", "합이 합계와 다름"),
+        ("123-45-67890 발행", "검증 숫자"),
+        ("123-45-67891 와 220-81-62517", "여러 개"),
+    ]:
+        assert any(warning in w for w in extract_invoice(text, day_of)[2]), text
+    fields, missing, _warnings = extract_invoice("세금계산서 발행 부탁드립니다", day_of)
+    assert fields["supply"] is None and set(missing) == {"상호", "사업자번호", "공급가액", "작성일"}
+    assert extract_invoice("11월 20일 오후 3시", None)[0]["date"] is None
+    invoice_row = {
+        "room": "방", "sender": "최", "date": "2026년 11월 7일 토요일", "time": "오전 9:00",
+        "text": "A상사 11월 20일 부가세 별도 100만원 발행 부탁드립니다", "following": ["사업자번호 123-45-67891"],
+    }
+    good = draft_invoice(invoice_row)
+    assert good["status"] == "초안" and good["business_number"] == "123-45-67891" and not good["missing"]
+    assert draft_invoice({**invoice_row, "following": []})["status"] == "확인 필요"
+    chat = parse("[최] [오전 9:00] 발행 부탁\n[최] [오전 9:01] 번호요\n[김] [오전 9:02] 네\n[최] [오전 9:03] 늦은 말")
+    assert following_from_sender(chat, 0) == ["번호요"]
 
     saturday = datetime.date(2026, 11, 7)
     at = datetime.time
@@ -515,6 +830,9 @@ def main():
     )
     parser.add_argument("--scroll", type=int, default=0, help="읽기 전에 위로 스크롤할 횟수. 과거 대화를 불러옴")
     parser.add_argument("--events", help="일정 메시지를 비교할 캘린더 일정 JSON 파일. 수정은 하지 않음")
+    parser.add_argument("--invoices", action="store_true", help="세금계산서 요청을 찾아 검토용 초안 출력. 발행은 하지 않음")
+    parser.add_argument("--briefing", action="store_true", help="최근 메시지를 문제, 결정, 요청, 질문, 일정, 세금계산서로 정리")
+    parser.add_argument("--days", type=int, default=1, help="브리핑 기간. 1이면 오늘만")
     parser.add_argument(
         "--date",
         type=datetime.date.fromisoformat,
@@ -537,9 +855,12 @@ def main():
     key = os.environ.get("TYPESAFE_API_KEY", "")
     if not args.dry_run and not key:
         parser.error("TYPESAFE_API_KEY 환경 변수가 없습니다.")
+    if args.days < 1:
+        parser.error("--days는 1 이상이어야 합니다.")
     events = load_events(args.events) if args.events else None
-    if events is not None:
+    if events is not None and not args.briefing:
         args.category = "일정"
+    today = datetime.date.today()
 
     open_rooms = run_kakaocli("rooms")
     targets = [(r["title"], True) for r in open_rooms] if args.all_open else [(r, False) for r in args.rooms]
@@ -554,33 +875,59 @@ def main():
                 skipped.append((name, str(error)))
                 continue
             title = room["title"]
-            indexes = pending(messages, args.me)[-args.limit :]
-            rooms.append((title, len(messages), len(indexes)))
+            indexes = pending(messages, args.me)
+            notes = []
+            if args.briefing:
+                indexes, undated = recent_indexes(messages, indexes, today, args.days)
+                notes = coverage_notes(messages, today, args.days, len(indexes), args.limit, undated)
+            indexes = indexes[-args.limit :]
+            rooms.append((title, len(messages), len(indexes), notes))
             if not args.dry_run:
-                rows += judge(title, messages, indexes, key)
+                rows += judge(title, messages, indexes, key, invoices=args.invoices or args.briefing)
     finally:
         clear_clipboard()
         if previous:
             bring_to_front(previous)
 
     if args.dry_run:
-        for room, total, checked in rooms:
+        for room, total, checked, notes in rooms:
             print(f"[{room}] 읽음 {total}개, 판단 대상 {checked}개 (dry-run: 외부 전송 없음)")
+            for note in notes:
+                print(f"  주의: {note}")
         for room, reason in skipped:
             print(f"[{room}] 읽기 실패: {reason}")
         return
 
+    if args.briefing:
+        schedule = [r for r in rows if r.get("category") == "일정"]
+        proposals = None if events is None else [propose(row, events) for row in schedule]
+        briefing = build_briefing(rows, args.threshold, proposals)
+        if args.json:
+            coverage = [{"room": r, "read": t, "judged": c, "notes": n} for r, t, c, n in rooms]
+            print(json.dumps({**briefing, "rooms": coverage, "skipped": skipped}, ensure_ascii=False, indent=2))
+        else:
+            period = f"{today.isoformat()} 브리핑" if args.days == 1 else f"최근 {args.days}일 브리핑"
+            print_briefing(briefing, rooms, skipped, period)
+        return
+
     flagged, failed = bucket(rows, args.threshold, args.category or "")
     proposals = None if events is None else [propose(row, events) for row in flagged]
+    drafts = None
+    if args.invoices:
+        drafts = [draft_invoice(r) for r in rows if "error" not in r and r["invoice"] >= args.threshold]
     if args.json:
         output = {"flagged": flagged, "failed": failed, "skipped": skipped}
         if proposals is not None:
             output["proposals"] = proposals
+        if drafts is not None:
+            output["invoices"] = drafts
         print(json.dumps(output, ensure_ascii=False, indent=2))
     else:
         report(rooms, flagged, failed, skipped, args.threshold, args.category or "")
         if proposals is not None:
             print_proposals(proposals)
+        if drafts is not None:
+            print_invoices(drafts)
 
 
 if __name__ == "__main__":
